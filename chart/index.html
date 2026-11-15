@@ -461,7 +461,7 @@ function applyPriceFormat() {
   }
 }
 function futureAxisWhitespace(bars) {
-  if(app.replay.active || !bars.length || bars.at(-1).time!==app.fullData.at(-1)?.time)return [];
+  if(app.replay.active || !bars.length || bars.at(-1).time < (app.fullData.at(-1)?.time || 0))return [];
   // Empty time points create future dates on the axis without any invented prices.
   const last=bars.at(-1).time, horizon=new Date(last*1000);
   horizon.setUTCMonth(horizon.getUTCMonth()+5);
@@ -679,7 +679,7 @@ function persistReplayForSymbol(symbol, section) {
     clock = app.replay.pinnedClock;
     if (app.fullData.length) {
       const first = app.fullData[0].time;
-      const lastEnd = candleEndTime(app.fullData[app.fullData.length - 1], app.tf.key);
+      const lastEnd = maxReplayClockEnd();
       if (clock >= first && clock <= lastEnd) {
         app.replay.clockTime = clock;
         app.replay.pinnedClock = null;
@@ -2789,23 +2789,25 @@ async function performSymbolTf(symbol, tfKey, opts) {
   app.lowerByTf = {};
   app.builderData = [];
   app.builderTfKey = null;
-  if (!app.replay.active && preservedClock == null) {
-    applyLiveChartData();
-    centerOnBar(app.fullData.length - 1, 100);
-    Renderer.render();
-  }
-
   const lowerKeys = TF_ORDER.slice(0, Math.max(0, TF_ORDER.indexOf(tfKey)));
   for (const key of lowerKeys) {
     const rows = app.cache[symbol + "_" + key];
     if (rows?.length) app.lowerByTf[key] = rows;
   }
   app.finestData = app.lowerByTf[FINEST.key] || nextFullData;
+  if (!app.replay.active && preservedClock == null) {
+    applyLiveChartData();
+    centerOnBar(Math.max(0, app.renderedBars.length - 1), 100);
+    Renderer.render();
+  }
   // The first render uses cached lower bars; missing files enhance the ghost later.
-  // On remote/mobile connections, only preload lower TFs when replay is active,
-  // and fetch sequentially so user's active timeframe switch is never choked.
+  // On remote/mobile connections, preload finest (and 1d for W/M/3M) sequentially so
+  // live higher-timeframe ghost candles build immediately without choking the switch.
   const isLocalHost = location.hostname === "127.0.0.1" || location.hostname === "localhost";
-  const keysToPreload = (isLocalHost || app.replay.active || preservedClock != null) ? lowerKeys : [];
+  const remoteLiveKeys = lowerKeys.length
+    ? [...new Set([FINEST.key, (tfKey === "1mo" || tfKey === "3mo" || tfKey === "1w") ? "1d" : null].filter(k => k && lowerKeys.includes(k)))]
+    : [];
+  const keysToPreload = (isLocalHost || app.replay.active || preservedClock != null) ? lowerKeys : remoteLiveKeys;
   void (async () => {
     const results = [];
     for (const key of keysToPreload) {
@@ -2819,6 +2821,15 @@ async function performSymbolTf(symbol, tfKey, opts) {
     app.finestData = app.lowerByTf[FINEST.key] || nextFullData;
     const location = captureChartLocation();
     if (app.replay.active) {
+      if (app.replay.pinnedClock != null && app.fullData.length) {
+        const first = app.fullData[0].time, last = maxReplayClockEnd();
+        if (app.replay.pinnedClock >= first && app.replay.pinnedClock <= last) {
+          app.replay.clockTime = app.replay.pinnedClock;
+          app.replay.pinnedClock = null;
+          showHint("");
+        }
+      }
+      syncReplayBarIndexFromClock();
       syncReplayFineIndexFromClock();
       renderReplayFrame();
     } else { applyLiveChartData(); Renderer.render(); }
@@ -2841,7 +2852,7 @@ async function performSymbolTf(symbol, tfKey, opts) {
       });
       if (app.fullData.length) {
         const first = app.fullData[0].time;
-        const last = candleEndTime(app.fullData[app.fullData.length - 1], app.tf.key);
+        const last = maxReplayClockEnd();
         if (sharedClock < first || sharedClock > last) {
           app.replay.pinnedClock = sharedClock;
         }
@@ -2857,7 +2868,7 @@ async function performSymbolTf(symbol, tfKey, opts) {
         const trueClock = app.replay.clockTime;
         if (trueClock != null && app.fullData.length) {
           const first = app.fullData[0].time;
-          const last = candleEndTime(app.fullData[app.fullData.length - 1], app.tf.key);
+          const last = maxReplayClockEnd();
           if (trueClock < first || trueClock > last) {
             app.replay.pinnedClock = trueClock;
           } else {
@@ -2869,7 +2880,7 @@ async function performSymbolTf(symbol, tfKey, opts) {
         renderReplayFrame({ forceMedium: true });
         if (trueClock != null && app.fullData.length) {
           const first = app.fullData[0].time;
-          const last = candleEndTime(app.fullData[app.fullData.length - 1], app.tf.key);
+          const last = maxReplayClockEnd();
           if (trueClock >= first && trueClock <= last) {
             app.replay.clockTime = trueClock;
             app.replay.pinnedClock = null;
@@ -2887,7 +2898,7 @@ async function performSymbolTf(symbol, tfKey, opts) {
         try {
           app.chart.priceScale("right").applyOptions({ autoScale: true });
         } catch (_) {}
-        centerOnBar(app.fullData.length - 1, 100);
+        centerOnBar(Math.max(0, app.renderedBars.length - 1), 100);
       }
     }
   } else if (app.replay.active || preservedClock != null) {
@@ -2905,7 +2916,7 @@ async function performSymbolTf(symbol, tfKey, opts) {
     // Restore true clock if this TF covers it (don't stay stuck on clamp from a TF with no early data)
     if (trueClock != null && app.fullData.length) {
       const first = app.fullData[0].time;
-      const last = candleEndTime(app.fullData[app.fullData.length - 1], app.tf.key);
+      const last = maxReplayClockEnd();
       if (trueClock >= first && trueClock <= last) {
         app.replay.clockTime = trueClock;
         syncReplayBarIndexFromClock();
@@ -2926,9 +2937,9 @@ async function performSymbolTf(symbol, tfKey, opts) {
     applyLiveChartData();
     if (!tfChanged && savedRange?.from != null && savedRange?.to != null) {
       try { app.chart.timeScale().setVisibleRange(savedRange); }
-      catch { centerOnBar(app.fullData.length - 1, 100); }
+      catch { centerOnBar(Math.max(0, app.renderedBars.length - 1), 100); }
     } else {
-      centerOnBar(app.fullData.length - 1, 100);
+      centerOnBar(Math.max(0, app.renderedBars.length - 1), 100);
     }
   }
   restoreChartLocation(savedLocation);
@@ -3451,16 +3462,12 @@ function candleEndTime(c, tfKey, data, idx) {
     return next + BttTime.OFFSET;
   }
   if (tfKey === "1mo") {
-    const d = new Date(c.time * 1000);
-    return Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000);
+    const rep = new Date((c.time + 5 * 86400) * 1000);
+    const daysInMonth = new Date(Date.UTC(rep.getUTCFullYear(), rep.getUTCMonth() + 1, 0)).getUTCDate();
+    return c.time + daysInMonth * 86400;
   }
   if (tfKey === "1w") {
-    // Monday 00:00 UTC week of this open → end = next Monday (exclusive)
-    const d = new Date(c.time * 1000);
-    const day = d.getUTCDay();
-    const fromMon = (day + 6) % 7;
-    const startMs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - fromMon);
-    return Math.floor(startMs / 1000) + 7 * 86400;
+    return c.time + 7 * 86400;
   }
   const tf = TIMEFRAMES.find(t => t.key === tfKey);
   return (tf && tf.secs) ? c.time + tf.secs : c.time + 900;
@@ -3479,10 +3486,8 @@ function seriesCoversClock(series, clock) {
   if (clock == null || !series || !series.length) return false;
   if (clock < series[0].time) return false;
   const last = series[series.length - 1];
-  // Infer TF of series from spacing when possible; else allow through last.time + longest common
-  const lastEnd = series.length >= 2
-    ? Math.max(last.time + (last.time - series[series.length - 2].time), last.time)
-    : last.time;
+  const spacing = series.length >= 2 ? Math.max(900, last.time - series[series.length - 2].time) : 86400;
+  const lastEnd = last.time + spacing;
   return clock <= lastEnd || clock <= last.time;
 }
 
@@ -3498,25 +3503,58 @@ function fineCoversClock(clock) {
 }
 
 /**
+ * Return all loaded lower-TF series (finest-first: 15m → 30m → 1h → 4h → 1d → 1w)
+ * so developing candles on any HTF aggregate all closed lower-TF bars seamlessly.
+ */
+function getLoadedLowerSeriesList() {
+  const tfIdx = TF_ORDER.indexOf(app.tf.key);
+  if (tfIdx <= 0) return [];
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < tfIdx; i++) {
+    const key = TF_ORDER[i];
+    const data = app.lowerByTf[key];
+    if (data && data.length && data !== app.fullData && !seen.has(data)) {
+      seen.add(data);
+      out.push({ data, key, order: i });
+    }
+  }
+  if (app.builderData && app.builderData.length && app.builderData !== app.fullData && !seen.has(app.builderData)) {
+    const key = app.builderTfKey || FINEST.key;
+    seen.add(app.builderData);
+    out.push({ data: app.builderData, key, order: Math.max(0, TF_ORDER.indexOf(key)) });
+  }
+  if (app.finestData && app.finestData.length && app.finestData !== app.fullData && !seen.has(app.finestData)) {
+    seen.add(app.finestData);
+    out.push({ data: app.finestData, key: FINEST.key, order: 0 });
+  }
+  return out;
+}
+
+/**
+ * Maximum available clock end across fullData and any loaded lower-TF series.
+ */
+function maxReplayClockEnd() {
+  if (!app.fullData.length) return 0;
+  let maxEnd = candleEndTime(app.fullData[app.fullData.length - 1], app.tf.key, app.fullData, app.fullData.length - 1);
+  for (const { data: src, key: lowerKey } of getLoadedLowerSeriesList()) {
+    if (src.length) {
+      const e = barEndAt(src, src.length - 1, lowerKey) || src[src.length - 1].time;
+      if (e > maxEnd) maxEnd = e;
+    }
+  }
+  return maxEnd;
+}
+
+/**
  * Resolve the best lower-TF series for progressive formation at this clock.
  * Finest-first: 15m → 30m → 1h → 4h → 1d → 1w so any lower move updates all HTFs.
  */
 function getBuilderForClock(clock) {
   if (clock == null) return null;
-  const tfIdx = TF_ORDER.indexOf(app.tf.key);
-  if (tfIdx <= 0) return null;
-  for (let i = 0; i < tfIdx; i++) {
-    const key = TF_ORDER[i];
-    const data = app.lowerByTf[key];
-    if (data && data.length && data !== app.fullData && seriesCoversClock(data, clock)) {
-      return { data, key };
-    }
-  }
-  if (app.builderData && app.builderData.length && app.builderData !== app.fullData && seriesCoversClock(app.builderData, clock)) {
-    return { data: app.builderData, key: app.builderTfKey || FINEST.key };
-  }
-  if (app.finestData && app.finestData.length && app.finestData !== app.fullData && fineCoversClock(clock)) {
-    return { data: app.finestData, key: FINEST.key };
+  const list = getLoadedLowerSeriesList();
+  for (const item of list) {
+    if (clock >= item.data[0].time) return { data: item.data, key: item.key };
   }
   return null;
 }
@@ -3529,48 +3567,164 @@ function getBuilderForClock(clock) {
  */
 function buildDevelopingFromFinest(periodStart, clock, periodEnd) {
   if (periodStart == null || clock == null) return null;
-  const builder = getBuilderForClock(clock);
-  if (!builder) return null;
+  const lowerList = getLoadedLowerSeriesList();
+  if (!lowerList.length) return null;
 
-  const src = builder.data;
-  const lowerKey = builder.key || FINEST.key;
   const endLimit = periodEnd != null ? periodEnd : Infinity;
+  let open = null, openTime = Infinity, openOrder = Infinity;
+  let high = -Infinity, low = Infinity;
+  let close = null, closeEnd = -Infinity, closeTime = -Infinity, closeOrder = Infinity;
+  let fallbackOpen = null, fallbackTime = Infinity, fallbackOrder = Infinity;
 
-  // First index with time >= periodStart
-  let lo = 0, hi = src.length - 1, start = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (src[mid].time >= periodStart) { start = mid; hi = mid - 1; }
-    else lo = mid + 1;
-  }
-  if (start === -1) return null;
+  for (const { data: src, key: lowerKey, order } of lowerList) {
+    let lo = 0, hi = src.length - 1, start = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (src[mid].time >= periodStart) { start = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    if (start === -1) continue;
 
-  let open = null, high = -Infinity, low = Infinity, close = null;
-  for (let i = start; i < src.length; i++) {
-    const c = src[i];
-    if (c.time >= endLimit) break;
-    if (c.time > clock) break;
-    // Period of this lower bar must have fully ended by clock
-    const cEnd = barEndAt(src, i, lowerKey);
-    if (cEnd == null || cEnd > clock) break;
-    if (open === null) open = c.open;
-    if (c.high > high) high = c.high;
-    if (c.low < low) low = c.low;
-    close = c.close;
+    for (let i = start; i < src.length; i++) {
+      const c = src[i];
+      if (c.time >= endLimit) break;
+      if (c.time > clock) break;
+      if (c.time < fallbackTime || (c.time === fallbackTime && order < fallbackOrder)) {
+        fallbackOpen = c.open;
+        fallbackTime = c.time;
+        fallbackOrder = order;
+      }
+      // Period of this lower bar must have fully ended by clock
+      const cEnd = barEndAt(src, i, lowerKey);
+      if (cEnd == null || cEnd > clock) break;
+      if (c.time < openTime || (c.time === openTime && order < openOrder)) {
+        open = c.open;
+        openTime = c.time;
+        openOrder = order;
+      }
+      if (c.high > high) high = c.high;
+      if (c.low < low) low = c.low;
+      if (cEnd > closeEnd || (cEnd === closeEnd && (order < closeOrder || (order === closeOrder && c.time >= closeTime)))) {
+        close = c.close;
+        closeEnd = cEnd;
+        closeTime = c.time;
+        closeOrder = order;
+      }
+    }
   }
 
   if (open === null) {
-    // No fully closed lower bar yet — open-only of first lower bar that has started
-    for (let i = start; i < src.length; i++) {
-      const c = src[i];
-      if (c.time > clock) break;
-      if (c.time >= periodStart && c.time < endLimit) {
-        return { time: periodStart, open: c.open, high: c.open, low: c.open, close: c.open };
-      }
+    if (fallbackOpen !== null) {
+      return { time: periodStart, open: fallbackOpen, high: fallbackOpen, low: fallbackOpen, close: fallbackOpen };
     }
     return null;
   }
   return { time: periodStart, open, high, low, close };
+}
+
+/**
+ * Build any trailing HTF bars (and the current developing/ghost HTF bar) that
+ * exist in the lower-TF CSVs after the last closed HTF bar in app.fullData.
+ */
+function buildTrailingFromLower(clockLimit) {
+  const tfKey = app.tf.key;
+  const data = app.fullData;
+  if (!data.length || tfKey === FINEST.key) return { extraCompleted: [], developing: null };
+  const lowerList = getLoadedLowerSeriesList();
+  if (!lowerList.length) return { extraCompleted: [], developing: null };
+
+  const limit = clockLimit != null ? clockLimit : Infinity;
+  const lastIdx = data.length - 1;
+  const last = data[lastIdx];
+  const lastEnd = candleEndTime(last, tfKey, data, lastIdx);
+
+  let earliestAfter = Infinity;
+  let latestBarTime = -Infinity;
+  let latestClosedEnd = -Infinity;
+  for (const { data: src, key: lowerKey } of lowerList) {
+    const n = src.length;
+    if (!n) continue;
+    const tailEnd = barEndAt(src, n - 1, lowerKey) || src[n - 1].time;
+    if (tailEnd > latestClosedEnd) latestClosedEnd = tailEnd;
+
+    let lo = 0, hi = n - 1, idx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (src[mid].time >= lastEnd) { idx = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    if (idx !== -1 && src[idx].time <= limit && src[idx].time < earliestAfter) {
+      earliestAfter = src[idx].time;
+    }
+
+    lo = 0; hi = n - 1; idx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (src[mid].time <= limit) { idx = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    if (idx !== -1 && src[idx].time >= lastEnd && src[idx].time > latestBarTime) {
+      latestBarTime = src[idx].time;
+    }
+  }
+
+  if (!Number.isFinite(earliestAfter) || latestBarTime < lastEnd) {
+    return { extraCompleted: [], developing: null };
+  }
+
+  const extraCompleted = [];
+  let developing = null;
+  let pStart = lastEnd;
+  const tfObj = TIMEFRAMES.find(t => t.key === tfKey);
+  const tfSecs = tfObj && tfObj.secs ? tfObj.secs : null;
+
+  for (let step = 0; step < 64 && pStart <= latestBarTime && pStart <= limit; step++) {
+    let nextBarTime = Infinity;
+    for (const { data: src } of lowerList) {
+      let lo = 0, hi = src.length - 1, idx = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (src[mid].time >= pStart) { idx = mid; hi = mid - 1; }
+        else lo = mid + 1;
+      }
+      if (idx !== -1 && src[idx].time <= limit && src[idx].time < nextBarTime) {
+        nextBarTime = src[idx].time;
+      }
+    }
+    if (!Number.isFinite(nextBarTime)) break;
+
+    let pEnd = candleEndTime({ time: pStart }, tfKey);
+    if (nextBarTime >= pEnd) {
+      if (tfSecs) {
+        const skip = Math.max(1, Math.floor((nextBarTime - pStart) / tfSecs));
+        pStart += skip * tfSecs;
+      } else {
+        pStart = pEnd;
+      }
+      continue;
+    }
+
+    let barTime = pStart;
+    if ((tfKey === "1w" || tfKey === "1mo") && isForexComSymbol() && nextBarTime > pStart && (nextBarTime - pStart) <= 3 * 86400) {
+      barTime = nextBarTime;
+      pEnd = candleEndTime({ time: barTime }, tfKey);
+    }
+
+    const built = buildDevelopingFromFinest(pStart, Math.min(limit, pEnd), pEnd);
+    if (built) {
+      built.time = barTime;
+      const periodFullyClosed = pEnd <= limit && pEnd <= latestClosedEnd && latestBarTime >= pEnd;
+      if (periodFullyClosed) {
+        extraCompleted.push(built);
+      } else {
+        developing = built;
+        break;
+      }
+    }
+    pStart = pEnd;
+  }
+
+  return { extraCompleted, developing };
 }
 
 /**
@@ -3611,6 +3765,10 @@ function barsAtClock(clock) {
         };
       }
     }
+  } else {
+    const trailing = buildTrailingFromLower(clock);
+    if (trailing.extraCompleted.length) completed.push(...trailing.extraCompleted);
+    developing = trailing.developing;
   }
   return { completed, developing };
 }
@@ -3698,7 +3856,7 @@ function ensureReplayClockInData() {
   if (!app.fullData.length) return false;
   // Allow clock at bar open so a developing candle can appear before the first close
   const firstStart = app.fullData[0].time;
-  const lastEnd = candleEndTime(app.fullData[app.fullData.length - 1], app.tf.key);
+  const lastEnd = maxReplayClockEnd();
   if (app.replay.clockTime == null || !Number.isFinite(app.replay.clockTime)) {
     app.replay.clockTime = firstStart;
   } else if (app.replay.clockTime < firstStart) {
@@ -3772,8 +3930,27 @@ function applyLiveChartData() {
   const lastIdx = app.fullData.length - 1;
   const last = app.fullData[lastIdx];
   const end = candleEndTime(last, app.tf.key, app.fullData, lastIdx);
-  if (now < end) {
-    const body = buildDevelopingFromFinest(last.time, now, end) || {
+
+  // 1) If lower-TF CSVs have closed bars after the last closed HTF candle,
+  // build and display the trailing developing (faded/ghost) HTF candle.
+  const trailing = buildTrailingFromLower(Infinity);
+  if (trailing.extraCompleted.length || trailing.developing) {
+    const bars = app.fullData.concat(trailing.extraCompleted);
+    if (trailing.developing) {
+      bars.push(toFadedCandle(trailing.developing));
+      setPrimaryData(bars);
+      setDevelopingBar(trailing.developing);
+    } else {
+      setPrimaryData(bars);
+      setDevelopingBar(null);
+    }
+    return;
+  }
+
+  // 2) If the last bar already in fullData is still open (e.g. 3mo quarter or live period),
+  // rebuild its OHLC from closed lower-TF bars and render it faded.
+  if (now < end || app.tf.key === "3mo") {
+    const body = buildDevelopingFromFinest(last.time, Infinity, end) || {
       time: last.time,
       open: last.open,
       high: last.open,
@@ -3915,8 +4092,18 @@ async function startReplayAt(time, options={}) {
   document.getElementById('btnPlayPause').textContent='▶';
   const idx = options.exactCandle ? exactReplayBarIndex(app.fullData,time) : findBarIndexForTime(time);
   const htfBar = app.fullData[idx];
-  const periodStart = htfBar.time;
-  const periodEnd = candleEndTime(htfBar, app.tf.key, app.fullData, idx);
+  let periodStart = htfBar.time;
+  let periodEnd = candleEndTime(htfBar, app.tf.key, app.fullData, idx);
+  const lastIdx = app.fullData.length - 1;
+  const lastEnd = candleEndTime(app.fullData[lastIdx], app.tf.key, app.fullData, lastIdx);
+  if (time >= lastEnd) {
+    const trailing = buildTrailingFromLower(Infinity);
+    const targetBar = trailing.extraCompleted.find(b => b.time <= time && time < candleEndTime(b, app.tf.key)) || trailing.developing;
+    if (targetBar) {
+      periodStart = targetBar.time;
+      periodEnd = candleEndTime(targetBar, app.tf.key);
+    }
+  }
 
   // Anchor to the first lower-TF sub-bar inside this HTF period
   const fine = fineSeries();
@@ -3995,7 +4182,7 @@ function exitReplay() {
   try {
     app.chart.timeScale().applyOptions({ shiftVisibleRangeOnNewBar: true, rightOffset: 0, barSpacing: 6 });
   } catch (_) {}
-  centerOnBar(app.fullData.length - 1, 100);
+  centerOnBar(Math.max(0, app.renderedBars.length - 1), 100);
   document.getElementById("replayStatus").textContent = "Live view";
   ["btnStepBack", "btnPlayPause", "btnStepFwd", "btnExitReplay"].forEach(id => {
     document.getElementById(id).disabled = true;
@@ -4020,7 +4207,8 @@ document.getElementById("replayByDate").onclick = () => {
   document.getElementById("replayChoice").style.display="none";
   const inp = document.getElementById("replayDateInput");
   inp.min = displayBarDate(app.fullData[0].time);
-  inp.max = displayBarDate(app.fullData[app.fullData.length - 1].time);
+  const latestBar = (app.renderedBars && app.renderedBars.length) ? app.renderedBars[app.renderedBars.length - 1] : app.fullData[app.fullData.length - 1];
+  inp.max = displayBarDate(latestBar.time);
   if (inp.showPicker) inp.showPicker(); else inp.click();
 };
 document.getElementById("replayOnChart").onclick = () => { document.getElementById("replayChoice").style.display="none"; ReplayPicker.start(); };
@@ -4070,6 +4258,10 @@ function stepChartBar(direction) {
       const end = candleEndTime(data[i], app.tf.key, data, i);
       if (end > clock) { target = end; break; }
     }
+    if (target == null) {
+      const maxEnd = maxReplayClockEnd();
+      if (maxEnd > clock) target = maxEnd;
+    }
   } else {
     for (let i = data.length - 1; i >= 0; i--) {
       const end = candleEndTime(data[i], app.tf.key, data, i);
@@ -4092,18 +4284,28 @@ document.getElementById("btnStepFwd").onclick = () => {
   const fine = fineSeries();
   // Path A: lower-TF data covers this region → step one lower bar (progressive ghost OHLC)
   if (stepSeriesCoversClock(app.replay.clockTime) &&
-      app.replay.fineIndex >= 0 && fine.length &&
-      app.replay.fineIndex < fine.length - 1) {
-    const next = app.replay.fineIndex + 1;
-    if (fine[next].time >= app.replay.clockTime) {
-      app.replay.fineIndex = next;
-      app.replay.clockTime = fine[next].time;
-      syncReplayBarIndexFromClock();
-      renderReplayFrame();
-      persistReplayForSymbol(app.symbol, app.wlSection);
-      return;
+      app.replay.fineIndex >= 0 && fine.length) {
+    if (app.replay.fineIndex < fine.length - 1) {
+      const next = app.replay.fineIndex + 1;
+      if (fine[next].time >= app.replay.clockTime) {
+        app.replay.fineIndex = next;
+        app.replay.clockTime = fine[next].time;
+        syncReplayBarIndexFromClock();
+        renderReplayFrame();
+        persistReplayForSymbol(app.symbol, app.wlSection);
+        return;
+      }
+      syncReplayFineIndexFromClock();
+    } else {
+      const maxEnd = maxReplayClockEnd();
+      if (maxEnd > app.replay.clockTime) {
+        app.replay.clockTime = maxEnd;
+        syncReplayBarIndexFromClock();
+        renderReplayFrame();
+        persistReplayForSymbol(app.symbol, app.wlSection);
+        return;
+      }
     }
-    syncReplayFineIndexFromClock();
   }
   // Path B: no lower coverage (older dates) → step one bar on the ACTIVE timeframe
   // Keep the new bar as developing (faded) by landing on its open

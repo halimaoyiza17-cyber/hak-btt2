@@ -1,7 +1,7 @@
 /* BTT 2 position drawings: deterministic measurements, not executable orders. */
 (function(root){
  'use strict';
- const defaults={targetColor:'#089981',stopColor:'#f23645',opacity:.18,lineWidth:1,
+ const defaults={targetColor:'#089981',stopColor:'#f23645',opacity:.18,lineOpacity:1,lineWidth:1,
   showAlways:false,compact:false,showPriceLabels:true,accountSize:null,riskMode:'manual',
   riskAmount:null,quantity:null,pointValue:null,lotSize:null,leverage:null,
   accountCurrency:'',quoteCurrency:'',measurementUnit:'auto',pipSize:null};
@@ -32,7 +32,8 @@
   const p=s.position;
   p.targetColor=validColor(p.targetColor)?p.targetColor:defaults.targetColor;
   p.stopColor=validColor(p.stopColor)?p.stopColor:defaults.stopColor;
-  p.opacity=Number.isFinite(Number(p.opacity))?Math.max(0,Math.min(1,Number(p.opacity))):defaults.opacity;
+  p.opacity=(previous.opacity===undefined||previous.opacity===''||previous.opacity===null||!Number.isFinite(Number(previous.opacity)))?defaults.opacity:Math.max(0,Math.min(1,Number(previous.opacity)));
+  p.lineOpacity=(previous.lineOpacity===undefined||previous.lineOpacity===''||previous.lineOpacity===null||!Number.isFinite(Number(previous.lineOpacity)))?defaults.lineOpacity:Math.max(0,Math.min(1,Number(previous.lineOpacity)));
   p.lineWidth=Math.max(1,Math.min(5,positive(p.lineWidth)||1));
   p.showAlways=previous.showAlways==null?!!previous.alwaysStats:!!previous.showAlways;p.compact=!!p.compact;p.showPriceLabels=p.showPriceLabels!==false;
   p.riskMode=['manual','amount','percent'].includes(p.riskMode)?p.riskMode:'manual';
@@ -111,7 +112,13 @@
  }return baseAdd.call(this,s);};
  const baseLoad=Store.load;
  Store.load=function(){const result=baseLoad.call(this);for(const shapes of Object.values(this.bySymbol))for(const s of shapes||[])normalize(s);return result;};
- function rgba(hex,a){const n=parseInt(hex.slice(1),16);return `rgba(${n>>16},${n>>8&255},${n&255},${a})`;}
+ function rgba(hex,a){
+  const alpha=Math.max(0,Math.min(1,Number.isFinite(Number(a))?Number(a):1));
+  let h=String(hex||'#2962ff').trim().replace('#','');
+  if(h.length===3)h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  if(!/^[0-9a-f]{6}$/i.test(h))return `rgba(41,98,255,${alpha})`;
+  const n=parseInt(h,16);return `rgba(${n>>16},${n>>8&255},${n&255},${alpha})`;
+ }
  const textPrice=v=>typeof formatPrice==='function'?formatPrice(v):Number(v).toFixed(5);
  function short(v,d=2){return Number.isFinite(v)?v.toLocaleString('en-US',{maximumFractionDigits:d}):'—';}
  Renderer.drawPosition=function(s){
@@ -130,9 +137,9 @@
   ctx.setLineDash([]);ctx.lineWidth=p.lineWidth;
   for(const [y,color] of [[yt,p.targetColor],[ys,p.stopColor]]){
    ctx.fillStyle=rgba(color,p.opacity);ctx.fillRect(left,Math.min(ye,y),width,Math.abs(y-ye));
-   ctx.strokeStyle=color;ctx.strokeRect(left,Math.min(ye,y),width,Math.abs(y-ye));
+   ctx.strokeStyle=rgba(color,p.lineOpacity);ctx.strokeRect(left,Math.min(ye,y),width,Math.abs(y-ye));
   }
-  ctx.strokeStyle=typeof Theme!=='undefined'&&Theme.current==='dark'?'#d1d4dc':'#363a45';
+  ctx.strokeStyle=rgba(typeof Theme!=='undefined'&&Theme.current==='dark'?'#d1d4dc':'#363a45',p.lineOpacity);
   ctx.beginPath();ctx.moveTo(left,ye);ctx.lineTo(right,ye);ctx.stroke();
   if(!s.selected&&!p.showAlways){ctx.restore();return;}
   const info=api.statistics(s),o=info.outcome||{},r=info.rr;

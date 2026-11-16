@@ -226,7 +226,7 @@
 }
 
 </style>
-<link rel="stylesheet" href="btt2-workspace.css?v=2">
+<link rel="stylesheet" href="btt2-workspace.css?v=3">
 </head>
 <body>
 <div id="splash"><div class="splash-card"><div class="splash-logo">BTT 2</div><div class="splash-title">A clearer <span>perspective.</span></div><div class="splash-sub">Preparing your chart workspace</div><div class="splash-candles"><i style="--i:0"></i><i style="--i:1"></i><i style="--i:2"></i><i style="--i:3"></i><i style="--i:4"></i><i style="--i:5"></i><i style="--i:6"></i></div><div class="splash-caption">LOCAL DATA · LIMITLESS PERSPECTIVE</div></div></div>
@@ -475,7 +475,7 @@ function futureAxisWhitespace(bars) {
   horizon.setUTCMonth(horizon.getUTCMonth()+5);
   const max=Math.min(horizon.getTime()/1000,last+160*86400);
   const out=[];let time=last;
-  for(let i=0;i<900;i++){
+  for(let i=0;i<6500;i++){
     const next=candleEndTime({time},app.tf.key);
     if(!Number.isFinite(next)||next<=time||next>max)break;
     time=next;
@@ -1400,8 +1400,8 @@ const Coords = {
 //  DRAWING STORE — pure data only
 // ═══════════════════════════════════════════════════════════
 const DEFAULT_STYLE = {
-  color: "#2962ff", width: 2, fillColor: "#2962ff", fillOpacity: 0.12,
-  fontSize: 12, fontColor: "#131722",
+  color: "#2962ff", width: 2, opacity: 1, fillColor: "#2962ff", fillOpacity: 0.12,
+  fontSize: 12, fontColor: "#131722", fontOpacity: 1,
 };
 
 const Store = {
@@ -1600,9 +1600,58 @@ const Renderer = {
     this.render();
   },
 
+  _syncRaf: 0,
+  _syncFrames: 0,
+  _lastScaleSig: "",
+
+  _scaleSig() {
+    try {
+      const ts = app.chart?.timeScale?.();
+      const ps = activePriceSeries?.();
+      const vr = ts?.getVisibleLogicalRange?.();
+      const w = canvas.clientWidth || 0, h = canvas.clientHeight || 0;
+      const from = vr ? Math.round(vr.from) : 0, to = vr ? Math.round(vr.to) : 0;
+      const xA = ts?.logicalToCoordinate?.(from);
+      const xB = ts?.logicalToCoordinate?.(to);
+      const pTop = ps?.coordinateToPrice?.(8);
+      const pBot = ps?.coordinateToPrice?.(Math.max(16, h - 32));
+      return [
+        w, h,
+        vr && Number.isFinite(vr.from) ? vr.from.toFixed(4) : "",
+        vr && Number.isFinite(vr.to) ? vr.to.toFixed(4) : "",
+        Number.isFinite(xA) ? xA.toFixed(2) : "",
+        Number.isFinite(xB) ? xB.toFixed(2) : "",
+        Number.isFinite(pTop) ? pTop.toPrecision(8) : "",
+        Number.isFinite(pBot) ? pBot.toPrecision(8) : "",
+      ].join("|");
+    } catch (_) { return ""; }
+  },
+
+  /** Paint immediately and track Lightweight Charts' async layout/autoscale frames */
+  sync(frames = 8) {
+    this.render();
+    this._syncFrames = Math.max(this._syncFrames || 0, frames);
+    if (this._syncRaf || typeof requestAnimationFrame !== "function") return;
+    const step = () => {
+      this._syncRaf = 0;
+      if (this._syncFrames <= 0) return;
+      this._syncFrames--;
+      const sig = this._scaleSig();
+      if (sig && sig !== this._lastScaleSig) {
+        this._lastScaleSig = sig;
+        this.render();
+        try { window.BTT2TouchLoupe?.refresh?.(); } catch (_) {}
+        if (this._syncFrames < 4) this._syncFrames = 4;
+      }
+      if (this._syncFrames > 0) this._syncRaf = requestAnimationFrame(step);
+    };
+    this._syncRaf = requestAnimationFrame(step);
+  },
+
   /** Synchronous paint — call directly from chart range callbacks (no rAF lag) */
   render() {
     if (app.updatingSeries) return;
+    this._lastScaleSig = this._scaleSig();
     if (typeof HaksRanges !== "undefined") HaksRanges.draw();
     const w = canvas.clientWidth, h = canvas.clientHeight;
     ctx.clearRect(0, 0, w, h);
@@ -1674,9 +1723,13 @@ const Renderer = {
 
   drawShape(s) {
     const col = s.style?.color || "#2962ff";
+    const lineOp = normOpacity(s.style?.opacity, 1);
+    const fillOp = normOpacity(s.style?.fillOpacity, 0.12);
+    const fontOp = normOpacity(s.style?.fontOpacity, 1);
+    const strokeCol = hexRgba(col, lineOp);
     const lw = s.selected ? (s.style?.width || 2) + 0.5 : (s.style?.width || 2);
     ctx.save();
-    ctx.strokeStyle = col;
+    ctx.strokeStyle = strokeCol;
     ctx.lineWidth = lw;
     ctx.setLineDash(s.lineStyle === "dashed" ? [8,5] : s.lineStyle === "dotted" ? [2,4] : []);
 
@@ -1690,19 +1743,19 @@ const Renderer = {
       const y = Coords.priceToY(s.points[0].price);
       if (y == null) { ctx.restore(); return; }
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.clientWidth, y); ctx.stroke();
-      this.priceTag(y, s.points[0].price, col);
+      this.priceTag(y, s.points[0].price, col, lineOp);
     }
     else if (s.type === "hray") {
       const p = Coords.pointToScreen(s.points[0]);
       if (p.x == null || p.y == null) { ctx.restore(); return; }
       ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(canvas.clientWidth, p.y); ctx.stroke();
-      this.priceTag(p.y, s.points[0].price, col);
+      this.priceTag(p.y, s.points[0].price, col, lineOp);
     }
     else if (s.type === "vline") {
       const x = Coords.timeToX(s.points[0].time);
       if (x == null) { ctx.restore(); return; }
       ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.clientHeight); ctx.stroke();
-      this.timeTag(x, s.points[0].time, col);
+      this.timeTag(x, s.points[0].time, col, lineOp);
     }
     else if (s.type === "rect") {
       const a = Coords.pointToScreen(s.points[0]);
@@ -1710,7 +1763,7 @@ const Renderer = {
       if (a.x == null || a.y == null || b.x == null || b.y == null) { ctx.restore(); return; }
       const rx = Math.min(a.x, b.x), ry = Math.min(a.y, b.y);
       const rw = Math.abs(b.x - a.x), rh = Math.abs(b.y - a.y);
-      ctx.fillStyle = hexRgba(s.style?.fillColor || col, s.style?.fillOpacity ?? 0.12);
+      ctx.fillStyle = hexRgba(s.style?.fillColor || col, fillOp);
       ctx.fillRect(rx, ry, rw, rh);
       ctx.strokeRect(rx, ry, rw, rh);
       // Horizontal 50/50 midline — only when user turns it on
@@ -1745,21 +1798,22 @@ const Renderer = {
         ctx.moveTo(xL, lv.y);
         ctx.lineTo(xR, lv.y);
         ctx.stroke();
-        ctx.fillStyle = col;
+        ctx.fillStyle = strokeCol;
         ctx.fillText(lv.label + "  " + formatPrice(lv.price), xR + 4, lv.y + 4);
       }
       // Light vertical connectors
-      ctx.globalAlpha = 0.35;
+      ctx.save();
+      ctx.globalAlpha = 0.35 * lineOp;
       ctx.beginPath();
       ctx.moveTo(xL, y0); ctx.lineTo(xL, y1);
       ctx.moveTo(xR, y0); ctx.lineTo(xR, y1);
       ctx.stroke();
-      ctx.globalAlpha = 1;
+      ctx.restore();
     }
     else if (s.type === "text") {
       const p = Coords.pointToScreen(s.points[0]);
       if (p.x == null || p.y == null) { ctx.restore(); return; }
-      this.label(p.x, p.y, s.text || "Text", s.style?.fontColor || col, s.style?.fontSize || 12);
+      this.label(p.x, p.y, s.text || "Text", s.style?.fontColor || col, s.style?.fontSize || 12, fontOp);
     }
     else if (s.type === "long" || s.type === "short") {
       this.drawPosition(s);
@@ -1899,14 +1953,17 @@ const Renderer = {
     ctx.restore();
   },
 
-  label(x, y, text, color, size = 11) {
+  label(x, y, text, color, size = 11, opacity = 1) {
     if (!text) return;
+    const op = normOpacity(opacity, 1);
+    ctx.save();
     ctx.font = `${size}px -apple-system,Segoe UI,Arial,sans-serif`;
     const tw = ctx.measureText(text).width + 8;
-    ctx.fillStyle = color;
+    ctx.fillStyle = hexRgba(color, op);
     ctx.fillRect(x, y - 14, tw, 16);
-    ctx.fillStyle = "#fff";
+    ctx.fillStyle = hexRgba("#ffffff", op);
     ctx.fillText(text, x + 4, y - 2);
+    ctx.restore();
   },
 
   shapeBounds(s) {
@@ -1922,8 +1979,9 @@ const Renderer = {
     const b = this.shapeBounds(s); if (!b) return;
     const pos = String(s.textPosition || "center-top").split("-");
     const h = pos[0], v = pos[1] || "top", pad = 6;
+    const fontOp = normOpacity(s.style?.fontOpacity, 1);
     ctx.font = `${s.style?.fontSize || 12}px -apple-system,Segoe UI,Arial,sans-serif`;
-    ctx.fillStyle = s.style?.fontColor || s.style?.color || "#2962ff";
+    ctx.fillStyle = hexRgba(s.style?.fontColor || s.style?.color || "#2962ff", fontOp);
     ctx.textAlign = h === "left" ? "left" : h === "right" ? "right" : "center";
     ctx.textBaseline = v === "top" ? "bottom" : v === "bottom" ? "top" : "middle";
     const x = h === "left" ? b.left + pad : h === "right" ? b.right - pad : (b.left + b.right) / 2;
@@ -1932,11 +1990,12 @@ const Renderer = {
     ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
   },
 
-  timeTag(x, time, color) {
+  timeTag(x, time, color, opacity = 1) {
     const text = displayBarTime(time);
+    const op = normOpacity(opacity, 1);
     ctx.font="11px -apple-system,Segoe UI,Arial,sans-serif"; const tw=ctx.measureText(text).width+10;
     const left=Math.max(0,Math.min(canvas.clientWidth-tw,x-tw/2)), y=canvas.clientHeight-19;
-    ctx.fillStyle=color; ctx.fillRect(left,y,tw,18); ctx.fillStyle="#fff"; ctx.fillText(text,left+5,y+13);
+    ctx.fillStyle=hexRgba(color, op); ctx.fillRect(left,y,tw,18); ctx.fillStyle=hexRgba("#ffffff", Math.max(0.2, op)); ctx.fillText(text,left+5,y+13);
   },
 
   drawReplayGuide(time) {
@@ -1945,20 +2004,32 @@ const Renderer = {
     this.timeTag(x,time,"#f59e0b"); ctx.restore();
   },
 
-  priceTag(y, price, color) {
+  priceTag(y, price, color, opacity = 1) {
     const text = formatPrice(price);
+    const op = normOpacity(opacity, 1);
     ctx.font = "11px -apple-system,Segoe UI,Arial,sans-serif";
     const tw = ctx.measureText(text).width + 10;
-    ctx.fillStyle = color;
+    ctx.fillStyle = hexRgba(color, op);
     ctx.fillRect(canvas.clientWidth - tw - 2, y - 9, tw, 18);
-    ctx.fillStyle = "#fff";
+    ctx.fillStyle = hexRgba("#ffffff", Math.max(0.2, op));
     ctx.fillText(text, canvas.clientWidth - tw + 3, y + 4);
   },
 };
 
-function hexRgba(hex, a) {
-  const h = (hex || "#2962ff").replace("#", "");
-  return `rgba(${parseInt(h.slice(0,2),16)},${parseInt(h.slice(2,4),16)},${parseInt(h.slice(4,6),16)},${a})`;
+function normOpacity(v, fallback = 1) {
+  const n = (v === null || v === undefined || v === "") ? NaN : Number(v);
+  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : fallback;
+}
+
+function hexRgba(hex, a = 1) {
+  const alpha = normOpacity(a, 1);
+  const c = String(hex || "#2962ff").trim();
+  const rgbMatch = c.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i);
+  if (rgbMatch) return `rgba(${rgbMatch[1]},${rgbMatch[2]},${rgbMatch[3]},${alpha})`;
+  let h = c.replace("#", "");
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  if (!/^[0-9a-f]{6}$/i.test(h)) return `rgba(41,98,255,${alpha})`;
+  return `rgba(${parseInt(h.slice(0,2),16)},${parseInt(h.slice(2,4),16)},${parseInt(h.slice(4,6),16)},${alpha})`;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3006,17 +3077,24 @@ function initChart() {
     box.textContent = `O ${formatPrice(d.open)}  H ${formatPrice(d.high)}  L ${formatPrice(d.low)}  C ${formatPrice(d.close)}${ghost}`;
   });
 
-  // CRITICAL: synchronous redraw on every view change — no rAF lag
-  const syncPaint = () => Renderer.render();
-  app.chart.timeScale().subscribeVisibleLogicalRangeChange(syncPaint);
-  // Logical-range notifications already repaint pan/zoom. Avoid the redundant time-range conversion during setData.
-  // During pan/zoom gestures, paint on every pointer/wheel event too
-  area.addEventListener("pointermove", () => {
-    if (!Interaction.drag && Interaction.tool === "cursor") Renderer.render();
+  // Frame-locked redraw on every zoom/pan/autoscale/pinch change
+  const syncPaint = (frames = 8) => Renderer.sync(frames);
+  app.chart.timeScale().subscribeVisibleLogicalRangeChange(() => syncPaint(8));
+  area.addEventListener("pointerdown", () => syncPaint(8), { passive: true });
+  area.addEventListener("pointermove", e => {
+    if (!Interaction.drag && (Interaction.tool === "cursor" || e.buttons)) syncPaint(5);
   }, { passive: true });
-  area.addEventListener("wheel", syncPaint, { passive: true });
+  area.addEventListener("pointerup", () => syncPaint(10), { passive: true });
+  area.addEventListener("pointercancel", () => syncPaint(6), { passive: true });
+  area.addEventListener("wheel", () => syncPaint(12), { passive: true });
+  area.addEventListener("dblclick", () => syncPaint(8), { passive: true });
+  area.addEventListener("touchstart", () => syncPaint(10), { passive: true });
+  area.addEventListener("touchmove", () => syncPaint(10), { passive: true });
+  area.addEventListener("touchend", () => syncPaint(14), { passive: true });
+  area.addEventListener("touchcancel", () => syncPaint(8), { passive: true });
 
   Renderer.resize();
+  Renderer.sync(6);
 }
 
 function applyChartType(type, persist = true) {
@@ -3098,6 +3176,7 @@ function restoreChartLocation(location) {
     const from = logical - location.bars * (location.fraction ?? 0.5);
     app.chart.timeScale().setVisibleLogicalRange({ from, to:from+location.bars });
     if (app.replay.active) app.replay.visibleBars = location.bars;
+    Renderer.sync(8);
     return true;
   };
   try {
@@ -3110,8 +3189,10 @@ function restoreChartLocation(location) {
       requestAnimationFrame(() => {
         if (pendingChartLocation !== pending) return;
         if (app.symbol === pending.symbol && app.tf.key === pending.tf) apply();
+        Renderer.sync(8);
         requestAnimationFrame(() => {
           if (pendingChartLocation === pending) pendingChartLocation = null;
+          Renderer.sync(6);
         });
       });
     }
@@ -4267,6 +4348,7 @@ function centerOnBar(barIndex, visibleBars) {
   try {
     ts.applyOptions({ rightOffset: 0, barSpacing: 6 });
     ts.setVisibleLogicalRange({ from: barIndex - half, to: barIndex + half });
+    Renderer.sync(8);
   } catch (_) {}
 }
 
@@ -5050,10 +5132,10 @@ function firstAvailableChart(files) {
   return null;
 }
 </script>
-<script src="btt2-drawings.js?v=2"></script>
-<script src="btt2-positions.js?v=2"></script>
-<script src="btt2-workspace.js?v=2"></script>
-<script src="btt2-phone.js?v=20261027"></script>
+<script src="btt2-drawings.js?v=3"></script>
+<script src="btt2-positions.js?v=3"></script>
+<script src="btt2-workspace.js?v=3"></script>
+<script src="btt2-phone.js?v=3"></script>
 <script>
 (async function boot() {
   Theme.apply(Theme.current, false);

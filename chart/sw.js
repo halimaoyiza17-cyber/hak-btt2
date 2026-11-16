@@ -1,5 +1,5 @@
-const APP_CACHE = "hak-btt2-app-v6";
-const DATA_CACHE = "hak-btt2-data-v6";
+const APP_CACHE = "hak-btt2-app-v7";
+const DATA_CACHE = "hak-btt2-data-v7";
 
 const APP_SHELL = [
   "./index.html",

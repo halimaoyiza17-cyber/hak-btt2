@@ -57,6 +57,12 @@
   .wl-item .wl-star.red{color:#e53935;opacity:1;}
   .wl-item .wl-star.black{color:#111111;opacity:1;}
   .wl-item .wl-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .wl-item .wl-bt-check{flex-shrink:0;color:var(--up);font-weight:700;font-size:11px;display:none;padding:0 2px;}
+  .wl-item.bt-done .wl-bt-check{display:inline-block;}
+  .bt-lock-bar{padding:6px 10px;font-size:11px;border-bottom:1px solid var(--border);background:color-mix(in srgb,var(--accent) 8%,transparent);display:flex;flex-direction:column;gap:2px;}
+  .bt-lock-bar strong{font-size:11px;color:var(--text);display:flex;align-items:center;justify-content:space-between;}
+  .bt-lock-bar span{font-size:10px;color:var(--text-dim);}
+  #btnExitReplay.bt-locked{opacity:.48;}
   .wl-empty{padding:8px 12px;font-size:11px;color:var(--text-dim);font-style:italic;}
   #wlContextMenu{position:fixed;z-index:100;background:var(--panel-2);border:1px solid var(--border);border-radius:6px;box-shadow:var(--shadow);padding:4px 0;min-width:180px;display:none;font-size:13px;}
   #wlContextMenu button{display:block;width:100%;text-align:left;border:none;background:none;padding:7px 14px;cursor:pointer;color:var(--text);font-size:13px;}
@@ -431,6 +437,8 @@ const app = {
   },
   /** Watchlist section the user last opened a pair from */
   wlSection: "pairs",
+  /** Per-backtesting-group week lock (btForex / btOther) */
+  btLocks: { btForex: null, btOther: null },
   /** Skip one session save while restoring (avoid overwrite loop) */
   _restoringSession: false,
 };
@@ -581,6 +589,12 @@ const WeekMarkers = {
   },
 
   update() {
+    const lockCtx = typeof BtWeekLock !== "undefined" ? BtWeekLock.activeContext() : null;
+    if (lockCtx && lockCtx.bounds) {
+      this._weekStart = lockCtx.bounds.start;
+      this._weekEnd = lockCtx.bounds.end;
+      return;
+    }
     const b = this.bounds(this.activeClock());
     if (!b) {
       this._weekStart = this._weekEnd = null;
@@ -669,6 +683,388 @@ const WeekMarkers = {
   },
 };
 
+/**
+ * Real-life Weekly Lock for Backtesting · Forex (btForex) and Backtesting · Other (btOther).
+ * All pairs in a Backtesting group stay locked inside the same active week until every pair
+ * in that group has finished the week. Normal Pairs / Section 1/2 / Observations stay unlocked.
+ */
+const BtWeekLock = {
+  KEY: "btt2_bt_locks_v1",
+
+  nsOf(sec) {
+    const ns = replayNamespace(sec != null ? sec : app.wlSection);
+    return (ns === "btForex" || ns === "btOther") ? ns : null;
+  },
+
+  labelOf(ns) {
+    return ns === "btForex" ? "Backtesting · Forex" : "Backtesting · Other";
+  },
+
+  pairsFor(ns) {
+    const raw = ns === "btForex" ? FOREX_PAIRS : OTHER_PAIRS;
+    const fileKeys = Object.keys(availableFiles);
+    if (!fileKeys.length) return raw;
+    const valid = raw.filter(sym => TF_ORDER.some(tf => availableFiles[sym + "_" + tf]));
+    return valid.length ? valid : raw;
+  },
+
+  pairBounds(symbol, anchorTime) {
+    const isFx = FOREX_PAIRS.includes(symbol);
+    const isMetal = symbol === "XAUUSD" || symbol === "XAGUSD";
+    const isDeriv = String(symbol || "").includes("INDEX") || String(symbol || "").startsWith("JUMP");
+    const useNyWeek = isFx || isMetal || isDeriv;
+    const openHour = isMetal ? 18 : 17;
+    return BttTime.weekBounds(anchorTime, useNyWeek, openHour);
+  },
+
+  anchorFromDateStr(dateStr, ns) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || "").trim());
+    if (!m) return null;
+    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12, 0, 0));
+    const dow = d.getUTCDay();
+    const shift = dow === 0 ? (ns === "btForex" ? 3 : -4) : (3 - dow);
+    d.setUTCDate(d.getUTCDate() + shift);
+    return Math.floor(d.getTime() / 1000) + BttTime.OFFSET;
+  },
+
+  anchorFromClock(clockTime, symbol) {
+    const b = this.pairBounds(symbol || app.symbol || "EURUSD", clockTime);
+    return Math.floor((b.start + b.end) / 2);
+  },
+
+  weekDateStr(anchorTime) {
+    const mon = new Date((anchorTime - BttTime.OFFSET - 2 * 86400) * 1000);
+    return mon.toISOString().slice(0, 10);
+  },
+
+  weekShortLabel(anchorTime) {
+    const mon = new Date((anchorTime - BttTime.OFFSET - 2 * 86400) * 1000);
+    return new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", day: "2-digit", month: "short", year: "2-digit" }).format(mon);
+  },
+
+  defaultStartDate() {
+    let refSec = Math.floor(Date.now() / 1000);
+    if (app.fullData && app.fullData.length) {
+      refSec = Math.min(refSec, app.fullData[app.fullData.length - 1].time - BttTime.OFFSET);
+    }
+    const d = new Date((refSec - 28 * 86400) * 1000);
+    const dow = d.getUTCDay();
+    const backToMon = (dow + 6) % 7;
+    d.setUTCDate(d.getUTCDate() - backToMon);
+    return d.toISOString().slice(0, 10);
+  },
+
+  _loadStorage() {
+    try {
+      const raw = localStorage.getItem(this.KEY);
+      if (raw) {
+        const p = JSON.parse(raw);
+        if (p && typeof p === "object") {
+          if (p.btForex) app.btLocks.btForex = p.btForex;
+          if (p.btOther) app.btLocks.btOther = p.btOther;
+        }
+      }
+    } catch (_) {}
+  },
+
+  save() {
+    try {
+      localStorage.setItem(this.KEY, JSON.stringify({
+        btForex: app.btLocks.btForex || null,
+        btOther: app.btLocks.btOther || null,
+      }));
+    } catch (_) {}
+  },
+
+  initFromDate(ns, dateStr, forceReset = true) {
+    const anchor = this.anchorFromDateStr(dateStr, ns);
+    if (!Number.isFinite(anchor)) return null;
+    const unix = Math.floor(new Date(dateStr + "T00:00:00Z").getTime() / 1000);
+    const pairs = this.pairsFor(ns);
+    app.btLocks[ns] = {
+      weekAnchor: anchor,
+      completed: {},
+      na: {},
+      hasMoreAfterEnd: {},
+    };
+    if (!app.replayBySection[ns]) app.replayBySection[ns] = {};
+    for (const sym of pairs) {
+      const b = this.pairBounds(sym, anchor);
+      const startClock = Math.max(unix, b.start);
+      if (forceReset || !app.replayBySection[ns][sym]?.active || app.replayBySection[ns][sym]?.clockTime == null) {
+        app.replayBySection[ns][sym] = {
+          active: true,
+          clockTime: Math.min(startClock, b.end - 1),
+          speedMs: app.replay.speedMs || 400,
+          visibleBars: app.replay.visibleBars || 100,
+        };
+      }
+    }
+    this.save();
+    return app.btLocks[ns];
+  },
+
+  ensureLock(ns) {
+    if (ns !== "btForex" && ns !== "btOther") return null;
+    let lock = app.btLocks[ns];
+    if (lock && Number.isFinite(lock.weekAnchor)) {
+      lock.completed = lock.completed || {};
+      lock.na = lock.na || {};
+      lock.hasMoreAfterEnd = lock.hasMoreAfterEnd || {};
+      return lock;
+    }
+
+    const pairs = this.pairsFor(ns);
+    const dateKey = ns === "btForex" ? "btForexDate" : "btOtherDate";
+    const savedMap = app.replayBySection[ns] || {};
+    let earliestClock = Infinity, earliestSym = pairs[0];
+    for (const sym of pairs) {
+      const entry = savedMap[sym];
+      if (entry && entry.active && Number.isFinite(entry.clockTime) && entry.clockTime < earliestClock) {
+        earliestClock = entry.clockTime;
+        earliestSym = sym;
+      }
+    }
+
+    let anchor = null;
+    if (Number.isFinite(earliestClock)) {
+      anchor = this.anchorFromClock(earliestClock, earliestSym);
+      if (!FavStore.data[dateKey]) {
+        FavStore.data[dateKey] = this.weekDateStr(anchor);
+        FavStore.save();
+      }
+    } else if (FavStore.data[dateKey]) {
+      anchor = this.anchorFromDateStr(FavStore.data[dateKey], ns);
+    }
+
+    if (!Number.isFinite(anchor)) {
+      const defDate = this.defaultStartDate();
+      FavStore.data[dateKey] = defDate;
+      FavStore.save();
+      return this.initFromDate(ns, defDate, false);
+    }
+
+    lock = { weekAnchor: anchor, completed: {}, na: {}, hasMoreAfterEnd: {} };
+    app.btLocks[ns] = lock;
+    if (!app.replayBySection[ns]) app.replayBySection[ns] = {};
+    for (const sym of pairs) {
+      const b = this.pairBounds(sym, anchor);
+      const entry = app.replayBySection[ns][sym];
+      if (!entry || !entry.active || !Number.isFinite(entry.clockTime)) {
+        app.replayBySection[ns][sym] = {
+          active: true,
+          clockTime: b.start,
+          speedMs: app.replay.speedMs || 400,
+          visibleBars: app.replay.visibleBars || 100,
+        };
+      } else if (entry.clockTime > b.end) {
+        entry.clockTime = b.start;
+      }
+    }
+    this.save();
+    return lock;
+  },
+
+  ensurePairEntry(symbol, ns) {
+    const lock = this.ensureLock(ns);
+    if (!lock) return null;
+    if (!app.replayBySection[ns]) app.replayBySection[ns] = {};
+    const b = this.pairBounds(symbol, lock.weekAnchor);
+    let entry = app.replayBySection[ns][symbol];
+    if (!entry || !entry.active || !Number.isFinite(entry.clockTime)) {
+      entry = {
+        active: true,
+        clockTime: b.start,
+        speedMs: app.replay.speedMs || 400,
+        visibleBars: app.replay.visibleBars || 100,
+      };
+      app.replayBySection[ns][symbol] = entry;
+    } else if (entry.clockTime > b.end && !lock.completed[symbol]) {
+      entry.clockTime = b.start;
+    }
+    return entry;
+  },
+
+  hasLoadedDataAfter(cutoff) {
+    if (app.fullData && app.fullData.length && app.fullData[app.fullData.length - 1].time >= cutoff) return true;
+    for (const { data: src } of getLoadedLowerSeriesList()) {
+      if (src && src.length && src[src.length - 1].time >= cutoff) return true;
+    }
+    return false;
+  },
+
+  activeContext(symbol, sec) {
+    const ns = this.nsOf(sec);
+    if (!ns || app._exitingBtInternal) return null;
+    const lock = this.ensureLock(ns);
+    if (!lock) return null;
+    const sym = symbol || app.symbol;
+    const bounds = this.pairBounds(sym, lock.weekAnchor);
+    const capEnd = bounds.end;
+    let finishClock = bounds.end;
+    let diskEnd = null;
+    let preLaunch = false;
+    if (sym === app.symbol && app.fullData && app.fullData.length) {
+      const firstTime = app.fullData[0].time;
+      diskEnd = maxReplayClockEnd();
+      const hasMore = this.hasLoadedDataAfter(bounds.end);
+      lock.hasMoreAfterEnd[sym] = hasMore;
+      if (firstTime >= bounds.end) {
+        preLaunch = true;
+      } else if (!hasMore && diskEnd >= bounds.start && diskEnd < bounds.end) {
+        finishClock = diskEnd;
+      }
+    }
+    return { ns, lock, symbol: sym, bounds, capEnd, finishClock, diskEnd, preLaunch };
+  },
+
+  progress(ns) {
+    const lock = this.ensureLock(ns);
+    if (!lock) return { doneCount: 0, total: 0, remainingPairs: [], label: "" };
+    const pairs = this.pairsFor(ns);
+    const remainingPairs = pairs.filter(p => !lock.completed[p] && !lock.na[p]);
+    return {
+      doneCount: pairs.length - remainingPairs.length,
+      total: pairs.length,
+      remainingPairs,
+      label: this.weekShortLabel(lock.weekAnchor),
+    };
+  },
+
+  notify(msg) {
+    showHint(msg);
+    try { window.BTT2UI?.toast?.(msg); } catch (_) {}
+  },
+
+  updateUI() {
+    const activeNs = this.nsOf();
+    const exitBtn = document.getElementById("btnExitReplay");
+    if (exitBtn) {
+      exitBtn.classList.toggle("bt-locked", !!activeNs);
+      exitBtn.title = activeNs
+        ? "Locked inside Backtesting so next week stays hidden (use Pairs for Live view)"
+        : "";
+    }
+    for (const ns of ["btForex", "btOther"]) {
+      const lock = app.btLocks[ns];
+      const bar = document.querySelector(`.bt-lock-bar[data-bt-group="${ns}"]`);
+      if (bar) {
+        if (lock && Number.isFinite(lock.weekAnchor)) {
+          const p = this.progress(ns);
+          bar.innerHTML =
+            `<strong><span>Week of ${this.weekShortLabel(lock.weekAnchor)}</span><span>${p.doneCount}/${p.total} ✓</span></strong>` +
+            `<span>${p.remainingPairs.length ? `Finish all pairs to unlock next week (next: ${p.remainingPairs[0]})` : "All pairs complete ✓"}</span>`;
+        } else {
+          bar.innerHTML =
+            `<strong><span>Week Lock Ready</span><span>Real-life mode</span></strong>` +
+            `<span>Open any pair or pick a Start date to begin</span>`;
+        }
+      }
+      document.querySelectorAll(`.wl-item`).forEach(el => {
+        if (replayNamespace(el.dataset.section) !== ns) return;
+        const sym = el.dataset.symbol;
+        const done = !!(lock && (lock.completed?.[sym] || lock.na?.[sym]));
+        el.classList.toggle("bt-done", done);
+      });
+    }
+  },
+
+  syncCurrentPairStatus() {
+    const ctx = this.activeContext();
+    if (!ctx || !app.replay.active) return ctx;
+    const { ns, lock, symbol, finishClock, preLaunch } = ctx;
+    let changed = false;
+    if (preLaunch) {
+      if (!lock.na[symbol]) { lock.na[symbol] = true; changed = true; }
+    } else {
+      if (lock.na[symbol]) { delete lock.na[symbol]; changed = true; }
+      const isDone = Number.isFinite(app.replay.clockTime) && app.replay.clockTime >= finishClock;
+      if (isDone && !lock.completed[symbol]) {
+        lock.completed[symbol] = true;
+        changed = true;
+      } else if (!isDone && lock.completed[symbol]) {
+        delete lock.completed[symbol];
+        changed = true;
+      }
+    }
+    if (changed) this.save();
+    this.updateUI();
+    return ctx;
+  },
+
+  tryUnlockNextWeek(ns) {
+    const lock = this.ensureLock(ns);
+    if (!lock) return false;
+    const p = this.progress(ns);
+    if (p.remainingPairs.length > 0) return false;
+    const pairs = this.pairsFor(ns);
+    const anyMore = pairs.some(sym => lock.hasMoreAfterEnd?.[sym]) ||
+      (this.nsOf() === ns && this.hasLoadedDataAfter(this.pairBounds(app.symbol, lock.weekAnchor).end));
+    if (!anyMore) {
+      this.notify(`All ${p.total} pairs in ${this.labelOf(ns)} completed through the latest downloaded week! Update Data when next week closes.`);
+      return false;
+    }
+    const oldAnchor = lock.weekAnchor;
+    lock.weekAnchor = oldAnchor + 7 * 86400;
+    lock.completed = {};
+    lock.na = {};
+    lock.hasMoreAfterEnd = {};
+    if (!app.replayBySection[ns]) app.replayBySection[ns] = {};
+    for (const sym of pairs) {
+      const nb = this.pairBounds(sym, lock.weekAnchor);
+      const entry = app.replayBySection[ns][sym];
+      if (!entry || !entry.active || !Number.isFinite(entry.clockTime) || entry.clockTime < nb.start) {
+        app.replayBySection[ns][sym] = {
+          active: true,
+          clockTime: nb.start,
+          speedMs: entry?.speedMs || app.replay.speedMs || 400,
+          visibleBars: entry?.visibleBars || app.replay.visibleBars || 100,
+        };
+      }
+    }
+    const newCtx = this.activeContext();
+    if (newCtx && app.replay.clockTime < newCtx.bounds.start) {
+      app.replay.clockTime = newCtx.bounds.start;
+    }
+    this.save();
+    Session.save();
+    this.updateUI();
+    this.notify(`All ${p.total} pairs complete! Unlocked Week of ${this.weekShortLabel(lock.weekAnchor)} ✓`);
+    return true;
+  },
+
+  pausePlayback() {
+    if (app.replay.playing) {
+      clearInterval(app.replay.timer);
+      app.replay.playing = false;
+      const btn = document.getElementById("btnPlayPause");
+      if (btn) btn.textContent = "▶";
+    }
+  },
+
+  onHitWeekBoundary(fromStep = true) {
+    const ctx = this.syncCurrentPairStatus();
+    if (!ctx) return false;
+    this.pausePlayback();
+    if (this.tryUnlockNextWeek(ctx.ns)) {
+      if (fromStep) renderReplayFrame();
+      return true;
+    }
+    const p = this.progress(ctx.ns);
+    if (p.remainingPairs.length > 0) {
+      const preview = p.remainingPairs.slice(0, 2).join(", ") + (p.remainingPairs.length > 2 ? ", …" : "");
+      this.notify(`${app.symbol} week done ✓ (${p.doneCount}/${p.total}) — finish remaining in ${this.labelOf(ctx.ns)}: ${preview}`);
+    }
+    return false;
+  },
+
+  notifyExitLocked() {
+    const ns = this.nsOf();
+    const p = ns ? this.progress(ns) : { doneCount: 0, total: 0 };
+    this.notify(`Exit Replay is locked in ${this.labelOf(ns)} (${p.doneCount}/${p.total} done) so next week stays hidden. Switch to Pairs for Live View.`);
+  },
+};
+
 /** Snapshot working replay into THIS section's slot for the pair */
 function persistReplayForSymbol(symbol, section) {
   if (!symbol) return;
@@ -697,6 +1093,9 @@ function persistReplayForSymbol(symbol, section) {
 /** Load pair replay for a section (live if never started in that section) */
 function restoreReplayForSymbol(symbol, section) {
   const ns = replayNamespace(section != null ? section : app.wlSection);
+  if (ns === "btForex" || ns === "btOther") {
+    BtWeekLock.ensurePairEntry(symbol, ns);
+  }
   const saved = (app.replayBySection[ns] || {})[symbol];
   if (app.replay.playing) {
     clearInterval(app.replay.timer);
@@ -743,6 +1142,7 @@ const Session = {
     if (app._restoringSession) return;
     try {
       persistReplayForSymbol(app.symbol, app.wlSection);
+      BtWeekLock.save();
       let visibleRange = null;
       try {
         visibleRange = app.chart?.timeScale().getVisibleRange() ?? null;
@@ -752,6 +1152,7 @@ const Session = {
         tfKey: app.tf?.key || "15m",
         wlSection: app.wlSection || "pairs",
         replayBySection: app.replayBySection,
+        btLocks: app.btLocks,
         replayBySymbol: {},
         replay: {
           active: !!app.replay.active,
@@ -767,6 +1168,7 @@ const Session = {
     } catch (_) {}
   },
   load() {
+    BtWeekLock._loadStorage();
     try {
       const raw = localStorage.getItem(this.KEY);
       if (!raw) return null;
@@ -778,6 +1180,10 @@ const Session = {
       } else if (parsed && parsed.replayBySymbol && typeof parsed.replayBySymbol === "object") {
         // Old global map → pairs only (do not poison Backtesting / Replay)
         app.replayBySection.pairs = parsed.replayBySymbol;
+      }
+      if (parsed && parsed.btLocks && typeof parsed.btLocks === "object") {
+        app.btLocks.btForex = app.btLocks.btForex || parsed.btLocks.btForex || null;
+        app.btLocks.btOther = app.btLocks.btOther || parsed.btLocks.btOther || null;
       }
       if (parsed && parsed.wlSection) app.wlSection = parsed.wlSection;
       return parsed;
@@ -2823,7 +3229,9 @@ async function performSymbolTf(symbol, tfKey, opts) {
     if (app.replay.active) {
       if (app.replay.pinnedClock != null && app.fullData.length) {
         const first = app.fullData[0].time, last = maxReplayClockEnd();
-        if (app.replay.pinnedClock >= first && app.replay.pinnedClock <= last) {
+        const lockCtxPin = BtWeekLock.activeContext();
+        const cap = lockCtxPin ? Math.min(last, lockCtxPin.capEnd) : last;
+        if (app.replay.pinnedClock >= first && app.replay.pinnedClock <= cap) {
           app.replay.clockTime = app.replay.pinnedClock;
           app.replay.pinnedClock = null;
           showHint("");
@@ -2832,6 +3240,7 @@ async function performSymbolTf(symbol, tfKey, opts) {
       syncReplayBarIndexFromClock();
       syncReplayFineIndexFromClock();
       renderReplayFrame();
+      BtWeekLock.syncCurrentPairStatus();
     } else { applyLiveChartData(); Renderer.render(); }
     // Supporting data must not undo the switch or a pan made while it loaded.
     restoreChartLocation(location);
@@ -2948,6 +3357,8 @@ async function performSymbolTf(symbol, tfKey, opts) {
   document.getElementById("symbolLabel").textContent = `${symbol} · ${app.tf.label}`;
   document.querySelectorAll(".tf-btn").forEach(b => b.classList.remove("loading"));
   showHint("");
+  BtWeekLock.syncCurrentPairStatus();
+  BtWeekLock.updateUI();
   Session.save();
   LOG("setSymbolTf", symbol, tfKey, "bars", app.fullData.length, "drawings", Store.items.length);
   window.dispatchEvent(new CustomEvent('btt2-chart-change', {detail:{symbol:app.symbol,tf:app.tf.key,section:app.wlSection}}));
@@ -3105,28 +3516,51 @@ const FavStore = {
  */
 async function applyBtSectionDate(group, dateStr) {
   if (!dateStr) return;
-  const pairs = group === "btForex" ? FOREX_PAIRS : OTHER_PAIRS;
+  const pairs = BtWeekLock.pairsFor(group);
+  const allPairs = group === "btForex" ? FOREX_PAIRS : OTHER_PAIRS;
   const ns = replayNamespace(group); // btForex | btOther only
   const unix = Math.floor(new Date(dateStr + "T00:00:00Z").getTime() / 1000);
   if (!Number.isFinite(unix)) return;
+
+  // Guard against accidentally jumping ahead of an unfinished locked week
+  const existingLock = app.btLocks[ns];
+  const newAnchor = BtWeekLock.anchorFromDateStr(dateStr, ns);
+  if (existingLock && Number.isFinite(existingLock.weekAnchor) && Number.isFinite(newAnchor) && newAnchor > existingLock.weekAnchor) {
+    const p = BtWeekLock.progress(ns);
+    if (p.remainingPairs.length > 0) {
+      const ok = window.confirm(
+        `${BtWeekLock.labelOf(ns)} still has ${p.remainingPairs.length} unfinished pair(s) in the Week of ${p.label} (${p.doneCount}/${p.total} ✓).\n\nReset all pairs and start fresh from ${dateStr}?`
+      );
+      if (!ok) {
+        const inp = document.querySelector(`.bt-date-input[data-bt-group="${group}"]`);
+        if (inp) inp.value = FavStore.data[group === "btForex" ? "btForexDate" : "btOtherDate"] || "";
+        return;
+      }
+    }
+  }
+
   if (group === "btForex") FavStore.data.btForexDate = dateStr;
   else FavStore.data.btOtherDate = dateStr;
   FavStore.save();
   if (!app.replayBySection[ns]) app.replayBySection[ns] = {};
-  for (const sym of pairs) {
-    // Only this backtesting namespace — never Pairs / Replay
+  for (const sym of allPairs) {
+    const anchorUse = Number.isFinite(newAnchor) ? newAnchor : unix;
+    const b = BtWeekLock.pairBounds(sym, anchorUse);
+    const startClock = Math.min(Math.max(unix, b.start), b.end - 1);
     app.replayBySection[ns][sym] = {
       active: true,
-      clockTime: unix,
+      clockTime: startClock,
       speedMs: app.replay.speedMs || 400,
       visibleBars: app.replay.visibleBars || 100,
     };
   }
-  showHint("Backtest date set — all pairs in this list start at " + dateStr);
+  BtWeekLock.initFromDate(ns, dateStr, true);
+  BtWeekLock.updateUI();
+  BtWeekLock.notify(`Week lock set (${BtWeekLock.labelOf(ns)}) — finish all ${pairs.length} pairs for week of ${dateStr} to unlock next week`);
   // Jump chart only if currently inside this BT group
-  if (pairs.includes(app.symbol) && replayNamespace(app.wlSection) === ns) {
+  if (allPairs.includes(app.symbol) && replayNamespace(app.wlSection) === ns) {
     try {
-      await startReplayAt(unix);
+      await startReplayAt(unix, { forceBtReset: true });
     } catch (_) {}
   }
   try { Session.save(); } catch (_) {}
@@ -3254,8 +3688,19 @@ function makeWlItem(symbol, sec) {
   nameEl.className = "wl-name";
   nameEl.textContent = symbol;
 
+  const btNs = replayNamespace(section);
+  const checkEl = document.createElement("span");
+  checkEl.className = "wl-bt-check";
+  checkEl.textContent = "✓";
+  checkEl.title = "Week completed";
+
   div.appendChild(starEl);
   div.appendChild(nameEl);
+  if (btNs === "btForex" || btNs === "btOther") {
+    const lock = app.btLocks[btNs];
+    if (lock && (lock.completed?.[symbol] || lock.na?.[symbol])) div.classList.add("bt-done");
+    div.appendChild(checkEl);
+  }
   // Every list: isolated per pair inside that section (no cross-pair clock copy)
   div.onclick = () => setSymbolTf(symbol, app.tf.key, { clockMode: "isolated", section });
   div.oncontextmenu = (e) => {
@@ -3357,6 +3802,8 @@ function buildWatchlist() {
     dateLab.textContent = "Start date (all pairs)";
     const dateInp = document.createElement("input");
     dateInp.type = "date";
+    dateInp.className = "bt-date-input";
+    dateInp.dataset.btGroup = groupKey;
     dateInp.value = FavStore.data[dateKey] || "";
     dateInp.style.cssText = "font-size:13px;padding:6px;border:1px solid var(--border);border-radius:4px;min-height:36px;";
     dateInp.onclick = (e) => e.stopPropagation();
@@ -3366,6 +3813,11 @@ function buildWatchlist() {
     dateRow.appendChild(dateLab);
     dateRow.appendChild(dateInp);
     body.appendChild(dateRow);
+
+    const progressBar = document.createElement("div");
+    progressBar.className = "bt-lock-bar";
+    progressBar.dataset.btGroup = groupKey;
+    body.appendChild(progressBar);
 
     // Nested Section 1 / 2
     const nest = (label, listKey, starKey) => {
@@ -3417,8 +3869,9 @@ function buildWatchlist() {
     "btOtherDate", "btOther_s1", "btOther_s2"
   );
 
-  // Highlight active
+  // Highlight active & sync week-lock badges
   updateWatchlistSelection();
+  BtWeekLock.updateUI();
 }
 
 document.addEventListener("click", (e) => {
@@ -3565,12 +4018,13 @@ function getBuilderForClock(clock) {
  * As each lower bar closes, high/low/close update → live rejection / continuation on the ghost.
  * Never uses the finished HTF CSV high/low/close while the HTF period is still open.
  */
-function buildDevelopingFromFinest(periodStart, clock, periodEnd) {
+function buildDevelopingFromFinest(periodStart, clock, periodEnd, maxBarTime) {
   if (periodStart == null || clock == null) return null;
   const lowerList = getLoadedLowerSeriesList();
   if (!lowerList.length) return null;
 
   const endLimit = periodEnd != null ? periodEnd : Infinity;
+  const capTime = maxBarTime != null ? maxBarTime : Infinity;
   let open = null, openTime = Infinity, openOrder = Infinity;
   let high = -Infinity, low = Infinity;
   let close = null, closeEnd = -Infinity, closeTime = -Infinity, closeOrder = Infinity;
@@ -3587,7 +4041,7 @@ function buildDevelopingFromFinest(periodStart, clock, periodEnd) {
 
     for (let i = start; i < src.length; i++) {
       const c = src[i];
-      if (c.time >= endLimit) break;
+      if (c.time >= endLimit || c.time >= capTime) break;
       if (c.time > clock) break;
       if (c.time < fallbackTime || (c.time === fallbackTime && order < fallbackOrder)) {
         fallbackOpen = c.open;
@@ -3626,17 +4080,19 @@ function buildDevelopingFromFinest(periodStart, clock, periodEnd) {
  * Build any trailing HTF bars (and the current developing/ghost HTF bar) that
  * exist in the lower-TF CSVs after the last closed HTF bar in app.fullData.
  */
-function buildTrailingFromLower(clockLimit) {
+function buildTrailingFromLower(clockLimit, maxBarTime) {
   const tfKey = app.tf.key;
   const data = app.fullData;
   if (!data.length || tfKey === FINEST.key) return { extraCompleted: [], developing: null };
   const lowerList = getLoadedLowerSeriesList();
   if (!lowerList.length) return { extraCompleted: [], developing: null };
 
-  const limit = clockLimit != null ? clockLimit : Infinity;
+  const capTime = maxBarTime != null ? maxBarTime : Infinity;
+  const limit = Math.min(clockLimit != null ? clockLimit : Infinity, capTime);
   const lastIdx = data.length - 1;
   const last = data[lastIdx];
   const lastEnd = candleEndTime(last, tfKey, data, lastIdx);
+  if (lastEnd >= capTime) return { extraCompleted: [], developing: null };
 
   let earliestAfter = Infinity;
   let latestBarTime = -Infinity;
@@ -3653,14 +4109,14 @@ function buildTrailingFromLower(clockLimit) {
       if (src[mid].time >= lastEnd) { idx = mid; hi = mid - 1; }
       else lo = mid + 1;
     }
-    if (idx !== -1 && src[idx].time <= limit && src[idx].time < earliestAfter) {
+    if (idx !== -1 && src[idx].time <= limit && src[idx].time < capTime && src[idx].time < earliestAfter) {
       earliestAfter = src[idx].time;
     }
 
     lo = 0; hi = n - 1; idx = -1;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      if (src[mid].time <= limit) { idx = mid; lo = mid + 1; }
+      if (src[mid].time <= limit && src[mid].time < capTime) { idx = mid; lo = mid + 1; }
       else hi = mid - 1;
     }
     if (idx !== -1 && src[idx].time >= lastEnd && src[idx].time > latestBarTime) {
@@ -3678,7 +4134,7 @@ function buildTrailingFromLower(clockLimit) {
   const tfObj = TIMEFRAMES.find(t => t.key === tfKey);
   const tfSecs = tfObj && tfObj.secs ? tfObj.secs : null;
 
-  for (let step = 0; step < 64 && pStart <= latestBarTime && pStart <= limit; step++) {
+  for (let step = 0; step < 64 && pStart <= latestBarTime && pStart <= limit && pStart < capTime; step++) {
     let nextBarTime = Infinity;
     for (const { data: src } of lowerList) {
       let lo = 0, hi = src.length - 1, idx = -1;
@@ -3687,7 +4143,7 @@ function buildTrailingFromLower(clockLimit) {
         if (src[mid].time >= pStart) { idx = mid; hi = mid - 1; }
         else lo = mid + 1;
       }
-      if (idx !== -1 && src[idx].time <= limit && src[idx].time < nextBarTime) {
+      if (idx !== -1 && src[idx].time <= limit && src[idx].time < capTime && src[idx].time < nextBarTime) {
         nextBarTime = src[idx].time;
       }
     }
@@ -3710,10 +4166,10 @@ function buildTrailingFromLower(clockLimit) {
       pEnd = candleEndTime({ time: barTime }, tfKey);
     }
 
-    const built = buildDevelopingFromFinest(pStart, Math.min(limit, pEnd), pEnd);
+    const built = buildDevelopingFromFinest(pStart, Math.min(limit, pEnd), pEnd, capTime);
     if (built) {
       built.time = barTime;
-      const periodFullyClosed = pEnd <= limit && pEnd <= latestClosedEnd && latestBarTime >= pEnd;
+      const periodFullyClosed = pEnd <= limit && pEnd <= latestClosedEnd && latestBarTime >= pEnd && pEnd <= capTime;
       if (periodFullyClosed) {
         extraCompleted.push(built);
       } else {
@@ -3737,9 +4193,13 @@ function barsAtClock(clock) {
   const data = app.fullData;
   if (!data.length || clock == null) return { completed: [], developing: null };
 
-  // Completed = bars whose full period has ended (end <= clock)
+  const lockCtx = app.replay.active ? BtWeekLock.activeContext() : null;
+  const hardCap = lockCtx ? lockCtx.capEnd : Infinity;
+
+  // Completed = bars whose full period has ended (end <= clock) and started before week lock cap
   let closedUpTo = -1;
   for (let i = 0; i < data.length; i++) {
+    if (data[i].time >= hardCap) break;
     const end = candleEndTime(data[i], tfKey, data, i);
     if (end <= clock) closedUpTo = i;
     else break;
@@ -3749,11 +4209,11 @@ function barsAtClock(clock) {
   // Developing = opened but not ended
   let developing = null;
   const openIdx = closedUpTo + 1;
-  if (openIdx < data.length) {
+  if (openIdx < data.length && data[openIdx].time < hardCap) {
     const candidate = data[openIdx];
     const end = candleEndTime(candidate, tfKey, data, openIdx);
     if (candidate.time <= clock && end > clock) {
-      developing = buildDevelopingFromFinest(candidate.time, clock, end);
+      developing = buildDevelopingFromFinest(candidate.time, clock, end, hardCap);
       if (!developing) {
         // No lower coverage: open-only — never finished HTF H/L/C
         developing = {
@@ -3765,8 +4225,8 @@ function barsAtClock(clock) {
         };
       }
     }
-  } else {
-    const trailing = buildTrailingFromLower(clock);
+  } else if (openIdx >= data.length || data[openIdx].time >= hardCap) {
+    const trailing = buildTrailingFromLower(clock, hardCap);
     if (trailing.extraCompleted.length) completed.push(...trailing.extraCompleted);
     developing = trailing.developing;
   }
@@ -3856,13 +4316,19 @@ function ensureReplayClockInData() {
   if (!app.fullData.length) return false;
   // Allow clock at bar open so a developing candle can appear before the first close
   const firstStart = app.fullData[0].time;
-  const lastEnd = maxReplayClockEnd();
+  const lockCtx = BtWeekLock.activeContext();
+  const maxAllowed = lockCtx ? Math.min(maxReplayClockEnd(), lockCtx.capEnd) : maxReplayClockEnd();
+  if (lockCtx && firstStart >= lockCtx.capEnd) {
+    app.replay.clockTime = firstStart;
+    app.replay.pinnedClock = lockCtx.bounds.start;
+    return true;
+  }
   if (app.replay.clockTime == null || !Number.isFinite(app.replay.clockTime)) {
     app.replay.clockTime = firstStart;
   } else if (app.replay.clockTime < firstStart) {
     app.replay.clockTime = firstStart;
-  } else if (app.replay.clockTime > lastEnd) {
-    app.replay.clockTime = lastEnd;
+  } else if (app.replay.clockTime > maxAllowed) {
+    app.replay.clockTime = maxAllowed;
   }
   return true;
 }
@@ -3879,6 +4345,8 @@ function renderReplayFrame(opts) {
     return;
   }
   const clock = app.replay.clockTime;
+  const lockCtx = BtWeekLock.activeContext();
+  const hardCap = lockCtx ? lockCtx.capEnd : Infinity;
   let { completed, developing } = barsAtClock(clock);
 
   // Safety net: if barsAtClock missed an in-progress bar (e.g. HTF/fine
@@ -3886,9 +4354,10 @@ function renderReplayFrame(opts) {
   if (!developing && app.fullData.length) {
     for (let i = 0; i < app.fullData.length; i++) {
       const c = app.fullData[i];
+      if (c.time >= hardCap) break;
       const end = candleEndTime(c, app.tf.key, app.fullData, i);
       if (c.time <= clock && clock < end) {
-        developing = buildDevelopingFromFinest(c.time, clock, end) || {
+        developing = buildDevelopingFromFinest(c.time, clock, end, hardCap) || {
           time: c.time, open: c.open, high: c.open, low: c.open, close: c.open,
         };
         completed = completed.filter(x => x.time !== c.time);
@@ -3914,8 +4383,14 @@ function renderReplayFrame(opts) {
   const totalBars = completed.length + (developing ? 1 : 0);
   fitReplayView(forceMedium, totalBars || 1, previousRange);
   const forming = developing ? " · forming" : "";
+  let lockSuffix = "";
+  if (lockCtx) {
+    const p = BtWeekLock.progress(lockCtx.ns);
+    const symDone = !!(lockCtx.lock.completed?.[app.symbol] || lockCtx.lock.na?.[app.symbol]);
+    lockSuffix = ` · Week ${p.doneCount}/${p.total}${symDone ? " ✓" : " (locked)"}`;
+  }
   document.getElementById("replayStatus").textContent =
-    "Replay: " + displayClock(clock) + " " + chartTimezone + forming;
+    "Replay: " + displayClock(clock) + " " + chartTimezone + forming + lockSuffix;
   Renderer.render();
 }
 
@@ -4080,6 +4555,11 @@ function exactReplayBarIndex(rows,time) {
 }
 async function startReplayAt(time, options={}) {
   if (!app.fullData.length) return;
+  const lockCtxGuard = (!options.forceBtReset && !options.exactClockRestore) ? BtWeekLock.activeContext() : null;
+  if (lockCtxGuard && time >= lockCtxGuard.capEnd) {
+    BtWeekLock.notify(`Next week is locked in ${BtWeekLock.labelOf(lockCtxGuard.ns)} — finish all pairs in this week first.`);
+    return;
+  }
   const selectedData=app.fullData, selectedSection=app.wlSection;
 
   // Guarantee lower-TF data is in memory for progressive formation
@@ -4136,6 +4616,15 @@ async function startReplayAt(time, options={}) {
   if (app.replay.clockTime >= periodEnd) {
     app.replay.clockTime = periodStart;
   }
+  const lockCtxAfter = BtWeekLock.activeContext();
+  if (lockCtxAfter) {
+    if (options.forceBtReset && app.replay.clockTime < lockCtxAfter.bounds.start) {
+      app.replay.clockTime = Math.max(app.fullData[0].time, Math.min(lockCtxAfter.bounds.start, lockCtxAfter.capEnd));
+    }
+    if (app.replay.clockTime > lockCtxAfter.capEnd) {
+      app.replay.clockTime = Math.max(app.fullData[0].time, Math.min(lockCtxAfter.bounds.start, lockCtxAfter.capEnd));
+    }
+  }
 
   syncReplayBarIndexFromClock();
 
@@ -4154,11 +4643,16 @@ async function startReplayAt(time, options={}) {
   });
   app.replay.pinnedClock = null;
   renderReplayFrame({ forceMedium: true });
+  BtWeekLock.syncCurrentPairStatus();
   persistReplayForSymbol(app.symbol, app.wlSection);
   Session.save();
 }
 
 function exitReplay() {
+  if (BtWeekLock.nsOf()) {
+    BtWeekLock.notifyExitLocked();
+    return;
+  }
   app.replay.active = false;
   app.replay.playing = false;
   app.replay.pinnedClock = null;
@@ -4207,8 +4701,13 @@ document.getElementById("replayByDate").onclick = () => {
   document.getElementById("replayChoice").style.display="none";
   const inp = document.getElementById("replayDateInput");
   inp.min = displayBarDate(app.fullData[0].time);
-  const latestBar = (app.renderedBars && app.renderedBars.length) ? app.renderedBars[app.renderedBars.length - 1] : app.fullData[app.fullData.length - 1];
-  inp.max = displayBarDate(latestBar.time);
+  const lockCtx = BtWeekLock.activeContext();
+  if (lockCtx) {
+    inp.max = displayBarDate(lockCtx.capEnd - 1);
+  } else {
+    const latestBar = (app.renderedBars && app.renderedBars.length) ? app.renderedBars[app.renderedBars.length - 1] : app.fullData[app.fullData.length - 1];
+    inp.max = displayBarDate(latestBar.time);
+  }
   if (inp.showPicker) inp.showPicker(); else inp.click();
 };
 document.getElementById("replayOnChart").onclick = () => { document.getElementById("replayChoice").style.display="none"; ReplayPicker.start(); };
@@ -4252,8 +4751,13 @@ function updateReplayMenu() {
 updateReplayMenu();
 function stepChartBar(direction) {
   const data = app.fullData, clock = app.replay.clockTime;
+  const lockCtx = BtWeekLock.activeContext();
   let target = null;
   if (direction > 0) {
+    if (lockCtx && clock >= lockCtx.finishClock) {
+      BtWeekLock.onHitWeekBoundary(true);
+      return;
+    }
     for (let i = 0; i < data.length; i++) {
       const end = candleEndTime(data[i], app.tf.key, data, i);
       if (end > clock) { target = end; break; }
@@ -4261,6 +4765,9 @@ function stepChartBar(direction) {
     if (target == null) {
       const maxEnd = maxReplayClockEnd();
       if (maxEnd > clock) target = maxEnd;
+    }
+    if (lockCtx && (target == null || target > lockCtx.finishClock)) {
+      if (clock < lockCtx.finishClock) target = lockCtx.finishClock;
     }
   } else {
     for (let i = data.length - 1; i >= 0; i--) {
@@ -4276,11 +4783,35 @@ function stepChartBar(direction) {
   syncReplayFineIndexFromClock();
   renderReplayFrame();
   persistReplayForSymbol(app.symbol, app.wlSection);
+  if (lockCtx) {
+    const hitEnd = direction > 0 && app.replay.clockTime >= lockCtx.finishClock;
+    BtWeekLock.syncCurrentPairStatus();
+    if (hitEnd) BtWeekLock.onHitWeekBoundary(true);
+    else Session.save();
+  }
 }
 document.getElementById("btnStepFwd").onclick = () => {
   if (app.switching) return;
   if (app.replay.active && app.fullData.length && replayModeControl.value === "bar") { stepChartBar(1); return; }
   if (!app.replay.active || !app.fullData.length) return;
+  const lockCtx = BtWeekLock.activeContext();
+  if (lockCtx && app.replay.clockTime >= lockCtx.finishClock) {
+    BtWeekLock.onHitWeekBoundary(true);
+    return;
+  }
+  const finishGradual = (targetClock) => {
+    app.replay.clockTime = targetClock;
+    syncReplayBarIndexFromClock();
+    syncReplayFineIndexFromClock();
+    renderReplayFrame();
+    persistReplayForSymbol(app.symbol, app.wlSection);
+    if (lockCtx) {
+      const hitEnd = app.replay.clockTime >= lockCtx.finishClock;
+      BtWeekLock.syncCurrentPairStatus();
+      if (hitEnd) BtWeekLock.onHitWeekBoundary(true);
+      else Session.save();
+    }
+  };
   const fine = fineSeries();
   // Path A: lower-TF data covers this region → step one lower bar (progressive ghost OHLC)
   if (stepSeriesCoversClock(app.replay.clockTime) &&
@@ -4288,21 +4819,20 @@ document.getElementById("btnStepFwd").onclick = () => {
     if (app.replay.fineIndex < fine.length - 1) {
       const next = app.replay.fineIndex + 1;
       if (fine[next].time >= app.replay.clockTime) {
+        if (lockCtx && fine[next].time >= lockCtx.finishClock) {
+          finishGradual(lockCtx.finishClock);
+          return;
+        }
         app.replay.fineIndex = next;
-        app.replay.clockTime = fine[next].time;
-        syncReplayBarIndexFromClock();
-        renderReplayFrame();
-        persistReplayForSymbol(app.symbol, app.wlSection);
+        finishGradual(fine[next].time);
         return;
       }
       syncReplayFineIndexFromClock();
     } else {
       const maxEnd = maxReplayClockEnd();
-      if (maxEnd > app.replay.clockTime) {
-        app.replay.clockTime = maxEnd;
-        syncReplayBarIndexFromClock();
-        renderReplayFrame();
-        persistReplayForSymbol(app.symbol, app.wlSection);
+      const targetEnd = lockCtx ? Math.min(maxEnd, lockCtx.finishClock) : maxEnd;
+      if (targetEnd > app.replay.clockTime) {
+        finishGradual(targetEnd);
         return;
       }
     }
@@ -4318,12 +4848,19 @@ document.getElementById("btnStepFwd").onclick = () => {
     // currently sitting inside barIndex's period — next step completes it and opens next
     nextBar = app.replay.barIndex + 1;
   }
-  if (nextBar >= app.fullData.length) return;
+  if (nextBar >= app.fullData.length) {
+    if (lockCtx && app.replay.clockTime < lockCtx.finishClock) {
+      finishGradual(lockCtx.finishClock);
+    }
+    return;
+  }
+  const nextTime = app.fullData[nextBar].time;
+  if (lockCtx && nextTime >= lockCtx.finishClock) {
+    finishGradual(lockCtx.finishClock);
+    return;
+  }
   app.replay.barIndex = nextBar;
-  app.replay.clockTime = app.fullData[nextBar].time;
-  syncReplayFineIndexFromClock();
-  renderReplayFrame();
-  persistReplayForSymbol(app.symbol, app.wlSection);
+  finishGradual(nextTime);
 };
 document.getElementById("btnStepBack").onclick = () => {
   if (app.switching) return;
@@ -4339,6 +4876,7 @@ document.getElementById("btnStepBack").onclick = () => {
       app.replay.clockTime = fine[prev].time;
       syncReplayBarIndexFromClock();
       renderReplayFrame();
+      BtWeekLock.syncCurrentPairStatus();
       persistReplayForSymbol(app.symbol, app.wlSection);
       return;
     }
@@ -4351,6 +4889,7 @@ document.getElementById("btnStepBack").onclick = () => {
   app.replay.clockTime = app.fullData[prevBar].time;
   syncReplayFineIndexFromClock();
   renderReplayFrame();
+  BtWeekLock.syncCurrentPairStatus();
   persistReplayForSymbol(app.symbol, app.wlSection);
 };
 document.getElementById("btnPlayPause").onclick = () => {
@@ -4516,12 +5055,11 @@ function firstAvailableChart(files) {
   TemplateStore.load();
   WeekMarkers.load();
   await discoverDataFiles();
-  buildWatchlist();
-  buildTfButtons();
-
-  // Restore last session (pair, TF, replay, chart view)
+  // Restore last session (pair, TF, replay, week locks, chart view) before rendering watchlist badges
   const saved = Session.load();
   migratePairSections(saved);
+  buildWatchlist();
+  buildTfButtons();
   let startSymbol = "EURUSD", startTf = "15m";
   const keys = Object.keys(availableFiles);
   if (saved?.symbol) startSymbol = saved.symbol;
@@ -4561,13 +5099,15 @@ function firstAvailableChart(files) {
         updateReplayMenu();
       }
       if (saved.replay.visibleBars) app.replay.visibleBars = saved.replay.visibleBars;
-      await startReplayAt(saved.replay.clockTime);
+      await startReplayAt(saved.replay.clockTime, { exactClockRestore: true });
       // startReplayAt anchors to bar open of that day; force exact clock if needed
       if (Number.isFinite(saved.replay.clockTime)) {
-        app.replay.clockTime = saved.replay.clockTime;
+        const bootLockCtx = BtWeekLock.activeContext();
+        app.replay.clockTime = bootLockCtx ? Math.min(saved.replay.clockTime, bootLockCtx.capEnd) : saved.replay.clockTime;
         syncReplayBarIndexFromClock();
         syncReplayFineIndexFromClock();
         renderReplayFrame({ forceMedium: true });
+        BtWeekLock.syncCurrentPairStatus();
       }
     } else {
       document.getElementById("replayStatus").textContent = "Live view";
@@ -4579,6 +5119,8 @@ function firstAvailableChart(files) {
   app._restoringSession = false;
   const observation=Observations.current();
   if(observation?.range?.from!=null) { try { app.chart.timeScale().setVisibleRange(observation.range); } catch(e){} }
+  BtWeekLock.syncCurrentPairStatus();
+  BtWeekLock.updateUI();
   Session.save();
   ObjectTree.render();
   setTimeout(() => document.getElementById("splash")?.classList.add("done"), 220);

@@ -3377,6 +3377,7 @@ const FavStore = {
     },
     section1: [],
     section2: [],
+    pairsOpen: true,
     replayOpen: false,
     btForexOpen: false,
     btOtherOpen: false,
@@ -3408,6 +3409,7 @@ const FavStore = {
         const parsed = JSON.parse(raw);
         this.data.section1 = Array.isArray(parsed.section1) ? parsed.section1 : [];
         this.data.section2 = Array.isArray(parsed.section2) ? parsed.section2 : [];
+        this.data.pairsOpen = parsed.pairsOpen === undefined ? true : !!parsed.pairsOpen;
         this.data.replayOpen = !!parsed.replayOpen;
         this.data.btForexOpen = !!parsed.btForexOpen;
         this.data.btOtherOpen = !!parsed.btOtherOpen;
@@ -3736,13 +3738,7 @@ function buildWatchlist() {
   FavStore.data.section1 = s1;
   FavStore.data.section2 = s2;
 
-  addSection("Section 1", s1, "section1");
-  addSection("Section 2", s2, "section2");
-  // Pairs All: hide pairs that live in Section 1 or 2 until removed
-  const pairsAll = PAIRS.filter(p => !s1.includes(p) && !s2.includes(p));
-  addSection("Pairs", pairsAll, "pairs");
-
-  // Simple collapsible (Replay)
+  // Simple collapsible
   const addCollapsible = (title, symbols, secKey, openFlag) => {
     const header = document.createElement("h4");
     header.style.cursor = "pointer";
@@ -3760,7 +3756,14 @@ function buildWatchlist() {
     el.appendChild(header);
     const body = document.createElement("div");
     body.style.display = isOpen ? "block" : "none";
-    ListOrder.sort(secKey,symbols).forEach(p => body.appendChild(makeWlItem(p, secKey)));
+    if (!symbols.length) {
+      const empty = document.createElement("div");
+      empty.className = "wl-empty";
+      empty.textContent = "All pairs are in Section 1 or Section 2";
+      body.appendChild(empty);
+    } else {
+      ListOrder.sort(secKey,symbols).forEach(p => body.appendChild(makeWlItem(p, secKey)));
+    }
     el.appendChild(body);
     header.onclick = (e) => {
       e.stopPropagation();
@@ -3770,6 +3773,12 @@ function buildWatchlist() {
       body.style.display = FavStore.data[openFlag] ? "block" : "none";
     };
   };
+
+  addSection("Section 1", s1, "section1");
+  addSection("Section 2", s2, "section2");
+  // Pairs All: hide pairs that live in Section 1 or 2 until removed; collapsible with ▼/▶ arrow
+  const pairsAll = PAIRS.filter(p => !s1.includes(p) && !s2.includes(p));
+  addCollapsible("Pairs", pairsAll, "pairs", "pairsOpen");
 
   /**
    * Backtesting block: date + nested Section 1/2 + full pair list

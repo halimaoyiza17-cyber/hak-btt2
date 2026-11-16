@@ -1,0 +1,86 @@
+{
+  "build_id": "d715590e9b74b036eee335b6140f18000f63d28c30046b9cf9dcf108426019ca",
+  "published_at": 1794854149,
+  "files": {
+    "btt-time.js": {
+      "sha256": "170b7857cea8853d312b2ec4e19e3b4e6477f8f974a284cca727dec291deb421",
+      "size": 3303
+    },
+    "btt2-drawings.js": {
+      "sha256": "e996e63bd86328c8d765a5930680edc0e6c79ed3c86aa93265864abf5676edab",
+      "size": 37416
+    },
+    "btt2-phone.js": {
+      "sha256": "74c69185325fae832fc8dc103baf54f03253e129aa417b6e814c23d21cafbc39",
+      "size": 6796
+    },
+    "btt2-positions.js": {
+      "sha256": "32192a771aff0e0de372c8d28f1a374e6749d962ffdc81e77f0d5083eeab83bf",
+      "size": 14144
+    },
+    "btt2-workspace.css": {
+      "sha256": "cd1b06b6bdf051162cb67710fe8110ed55f51152dd9a2f2285fa554b565f5c67",
+      "size": 32840
+    },
+    "btt2-workspace.js": {
+      "sha256": "c34276f3f8d5927d1a5c8c2f55dac8efc17e72ee7199b2460c67f5e7b41f1552",
+      "size": 64209
+    },
+    "confirmed-ranges.js": {
+      "sha256": "8b6bb033aaa72de9c856af5ffb77d4ffaa211c3c0b4dc5dab1db91046d2c7af4",
+      "size": 9277
+    },
+    "haks-ui.js": {
+      "sha256": "4483fd99ba500c5d492a9ef3be7e18a0d3c1cc0eca24e9e87872ad519baf7045",
+      "size": 15111
+    },
+    "icon-180.png": {
+      "sha256": "3b6521a806a0039fdd446ff3adc1c0af426ebea29ee5829ad9e5467fbb537dd2",
+      "size": 59685
+    },
+    "icon-192.png": {
+      "sha256": "fc4847ba13b196495857bfe4fbab50055ab1020aef9a350d8a50afd827e237a3",
+      "size": 66748
+    },
+    "icon-512.png": {
+      "sha256": "55695a4d3eec1a43779505f82b94d2e78e55aa9a25cab1e7946792d5d53d86d7",
+      "size": 397682
+    },
+    "index.html": {
+      "sha256": "d010c9c50219f9076c8b766089a000b80207e854ac046ffd3f795513186a1f46",
+      "size": 251729
+    },
+    "list-order.js": {
+      "sha256": "2509d52d31f1bf25b02e2919c28557bd6ae55e9110c4169f62c97c5fbfd404b6",
+      "size": 3879
+    },
+    "manifest.json": {
+      "sha256": "310f89febaae22312146d258d404143f8146ba2ada5cc640464e1ab4e5a2f5b3",
+      "size": 565
+    },
+    "observations.js": {
+      "sha256": "850de63695f75f69a4599ae0b7f98eb2c2428c02d582389f69f2c1a0eb47eb30",
+      "size": 6843
+    },
+    "position-tools.js": {
+      "sha256": "382c89a9a3c30d8e63c01d0422dfa1e4d894afc09cdf338a761831205acf53a4",
+      "size": 2256
+    },
+    "sw.js": {
+      "sha256": "215a68b911ae45a823882f9fd96a069cb93b449c675b42d7767c3cf06dadc9a7",
+      "size": 2583
+    },
+    "vendor/LICENSE-lightweight-charts.txt": {
+      "sha256": "70c9d5382506dd184465425c08a99ad9bd6d9ac1313c252968ba0b585e5ef823",
+      "size": 11347
+    },
+    "vendor/lightweight-charts.standalone.production.js": {
+      "sha256": "e21cc5caa0226ef30bd8549c50b9ef926615f2a4ee6b4e486353477a55f598cf",
+      "size": 197922
+    },
+    "vendor/package.json": {
+      "sha256": "ae840a473ee53012b64e120afaca887cd6cc4ef5fe6880036f11160e7b085baa",
+      "size": 310
+    }
+  }
+}

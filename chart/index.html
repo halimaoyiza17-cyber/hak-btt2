@@ -5082,6 +5082,7 @@ async function refreshDataFromDisk() {
     for (const k of Object.keys(availableFiles)) delete availableFiles[k];
     await discoverDataFiles();
     await setSymbolTf(app.symbol, app.tf.key, { clockMode: "isolated" });
+    if (typeof checkDesktopChartUpdate === "function") await checkDesktopChartUpdate(true);
     LOG("refreshDataFromDisk: done");
   } catch (e) {
     LOG("refreshDataFromDisk failed", e.message);
@@ -5219,9 +5220,85 @@ function firstAvailableChart(files) {
   window.dispatchEvent(new Event('btt2-ready'));
 })();
 setTimeout(() => document.getElementById("splash")?.classList.add("done"), 8000);
+async function applyAppUpdateReload() {
+  if (window._btt2Reloading) return;
+  window._btt2Reloading = true;
+  try { Observations?.capture?.(); Store?.save?.(); Session?.save?.(); } catch (_) {}
+  try {
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.filter(k => k.includes("app")).map(k => caches.delete(k)));
+    }
+    if (navigator.serviceWorker?.getRegistrations) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      const isLocalDesktop = location.hostname === "127.0.0.1" || location.hostname === "localhost";
+      await Promise.all(regs.map(r => (isLocalDesktop ? r.unregister() : r.update()).catch(() => {})));
+    }
+  } catch (_) {}
+  location.reload();
+}
+
+function showUpdateReadyBanner() {
+  if (document.getElementById("btt2UpdateBanner")) return;
+  const btn = document.createElement("button");
+  btn.id = "btt2UpdateBanner";
+  btn.type = "button";
+  btn.textContent = "New HAK BTT 2 update ready · Click to reload";
+  btn.style.cssText = "position:fixed;right:14px;bottom:52px;z-index:850;padding:8px 13px;border:0;border-radius:7px;background:#2962ff;color:#fff;font:600 12px/1.2 -apple-system,Segoe UI,Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.35);cursor:pointer;";
+  btn.onclick = () => { btn.textContent = "Reloading…"; applyAppUpdateReload(); };
+  document.body.appendChild(btn);
+}
+
+async function checkDesktopChartUpdate(forceCheck = false) {
+  try {
+    const res = await fetch("/__btt2__/chart_update" + (forceCheck ? "?check=1" : ""), { cache: "no-store" });
+    if (!res.ok) return false;
+    const data = await res.json();
+    if (!data || !data.ok) return false;
+    if (data.has_update) {
+      const busy = !!(Interaction?.drag || Interaction?.draft || app?.replay?.playing);
+      if (forceCheck || (!busy && performance.now() < 15000)) {
+        try { showHint?.("Applying new HAK BTT 2 update…"); } catch (_) {}
+        setTimeout(applyAppUpdateReload, 350);
+      } else {
+        showUpdateReadyBanner();
+      }
+      return true;
+    }
+    if (data.checking && !forceCheck) {
+      setTimeout(() => checkDesktopChartUpdate(false), 2200);
+    }
+  } catch (_) {}
+  return false;
+}
+
 if ("serviceWorker" in navigator) {
+  let _swReg = null;
+  const _hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!_hadController || window._btt2Reloading) return;
+    window._btt2Reloading = true;
+    try { Observations?.capture?.(); Store?.save?.(); Session?.save?.(); } catch (_) {}
+    location.reload();
+  });
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
+    navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then(reg => {
+      _swReg = reg;
+      reg.update().catch(() => {});
+    }).catch(() => {});
+    setTimeout(() => checkDesktopChartUpdate(false), 1800);
+    setTimeout(() => checkDesktopChartUpdate(false), 5500);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      _swReg?.update?.().catch(() => {});
+      checkDesktopChartUpdate(false);
+    }
+  });
+} else {
+  window.addEventListener("load", () => {
+    setTimeout(() => checkDesktopChartUpdate(false), 1800);
+    setTimeout(() => checkDesktopChartUpdate(false), 5500);
   });
 }
 </script>

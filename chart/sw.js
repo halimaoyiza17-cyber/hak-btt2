@@ -1,5 +1,5 @@
-const APP_CACHE = "hak-btt2-app-v9";
-const DATA_CACHE = "hak-btt2-data-v9";
+const APP_CACHE = "hak-btt2-app-v10";
+const DATA_CACHE = "hak-btt2-data-v10";
 
 const APP_SHELL = [
   "./index.html",
@@ -23,7 +23,9 @@ const APP_SHELL = [
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(APP_CACHE).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting())
+    caches.open(APP_CACHE)
+      .then((cache) => cache.addAll(APP_SHELL.map((u) => new Request(u, { cache: "no-cache" }))))
+      .then(() => self.skipWaiting())
   );
 });
 
@@ -74,7 +76,7 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       caches.open(APP_CACHE).then(async (cache) => {
         try {
-          const fresh = await fetch(event.request);
+          const fresh = await fetch(event.request.url, { cache: "no-cache" });
           if (fresh && fresh.ok) {
             cache.put(event.request, fresh.clone());
             return fresh;
